@@ -1,3 +1,31 @@
+> ## Personal Fork — Install & Update
+>
+> This is a personal fork on the **`personal-tooling`** branch. It adds `scripts/deploy.sh` and [DASHBOARD.md](DASHBOARD.md) on top of upstream `dev`.
+>
+> **Update an existing install (from the repo root):**
+>
+> ```bash
+> ./scripts/deploy.sh
+> ```
+>
+> Builds the CLI binary and Web UI from the current checkout, installs to `/usr/local/bin/archon`, stages the web UI into `~/.archon/web-dist/<version>/`, removes any stale PATH-shadow symlinks (`~/.bun/bin/archon`), and (re)loads the launchd agent `diy.archon.serve` (autostart on login, auto-restart on crash).
+>
+> **Reinstall on a fresh machine:**
+>
+> ```bash
+> # Prerequisites: bun (https://bun.sh) and gh (https://cli.github.com)
+> git clone -b personal-tooling https://github.com/Pr0j3c7t0dd-Ltd/Archon.git
+> cd Archon
+> bun install
+> ./scripts/deploy.sh
+> ```
+>
+> Useful flags: `--ref dev` (pull a specific ref first), `--release vX.Y.Z` (install a published release via the canonical curl installer instead of building), `--validate` (run the full `bun run validate` gate before building), `--no-restart`, `--skip-launchd`, `--force`. `./scripts/deploy.sh --help` for the full list.
+>
+> After deploy, the dashboard runs at **http://localhost:3090**. See [DASHBOARD.md](DASHBOARD.md) for service management (status, restart, logs).
+>
+> ---
+
 <p align="center">
   <img src="assets/logo.png" alt="Archon" width="160" />
 </p>
