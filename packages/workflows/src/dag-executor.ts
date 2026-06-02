@@ -1286,6 +1286,8 @@ interface LoopBashConditionOptions {
   issueContext?: string;
   loopUserInput: string;
   loopPrevOutput: string;
+  loopIteration?: number;
+  loopIterationStartedAtMs?: number;
   nodeOutputs: Map<string, NodeOutput>;
   logDir: string;
 }
@@ -1321,6 +1323,12 @@ async function evaluateLoopBashCondition(options: LoopBashConditionOptions): Pro
         ARGUMENTS: options.workflowRun.user_message,
         LOOP_USER_INPUT: options.loopUserInput,
         LOOP_PREV_OUTPUT: options.loopPrevOutput,
+        ARCHON_LOOP_ITERATION:
+          options.loopIteration === undefined ? '' : String(options.loopIteration),
+        ARCHON_LOOP_ITERATION_STARTED_AT_MS:
+          options.loopIterationStartedAtMs === undefined
+            ? ''
+            : String(options.loopIterationStartedAtMs),
         REJECTION_REASON: '',
         CONTEXT: options.issueContext ?? '',
         EXTERNAL_CONTEXT: options.issueContext ?? '',
@@ -2001,6 +2009,8 @@ async function executeLoopNode(
                   issueContext,
                   loopUserInput: loopInputForIteration,
                   loopPrevOutput: loopPrevOutputForIteration,
+                  loopIteration: i,
+                  loopIterationStartedAtMs: iterationStart,
                   nodeOutputs,
                   logDir,
                 }),
@@ -2191,7 +2201,14 @@ async function executeLoopNode(
     }
 
     // Notify on idle timeout
-    if (iterationIdleTimedOut) {
+    if (iterationIdleTimedOut && fullOutput.trim() === '') {
+      await safeSendMessage(
+        platform,
+        conversationId,
+        `Loop node '${node.id}' iteration ${String(i)} hit idle timeout without assistant output (no output for ${String((node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS) / 60000)} min)`,
+        msgContext
+      );
+    } else if (iterationIdleTimedOut) {
       await safeSendMessage(
         platform,
         conversationId,
@@ -2210,12 +2227,10 @@ async function executeLoopNode(
     // Empty assistant output is an iteration failure for AI loops — same
     // contract as the single-shot AI-node guard in executeNodeInternal. A
     // provider stream that closed cleanly with zero content typically means
-    // a silent rejection or interruption; left unchecked, an interactive
-    // loop would pause with a blank gate or burn the full max_iterations
-    // budget producing nothing. Idle-timeout exits are exempt — the
-    // notification above has already told the user the iteration completed
-    // via timeout, and flipping that to a failure would contradict it.
-    if (!iterationIdleTimedOut && !iterationExternallyCompleted && fullOutput.trim() === '') {
+    // a silent rejection or interruption. An idle timeout with zero content is
+    // the same failure mode with a longer wait; treating it as a completed
+    // iteration pauses the controller without advancing durable state.
+    if (!iterationExternallyCompleted && fullOutput.trim() === '') {
       const iterationDuration = Date.now() - iterationStart;
       const emptyError =
         'Loop iteration produced no assistant output. The provider stream closed without yielding content — likely a silent provider rejection or stream interruption.';
