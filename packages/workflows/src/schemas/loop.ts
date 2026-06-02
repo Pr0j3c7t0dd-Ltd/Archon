@@ -15,6 +15,10 @@ export const loopNodeConfigSchema = z
     fresh_context: z.boolean().default(false),
     /** Optional bash script run after each iteration; exit 0 = complete. */
     until_bash: z.string().optional(),
+    /** Optional bash script polled while the provider is silent; exit 0 = current iteration complete. */
+    iteration_until_bash: z.string().optional(),
+    /** Poll interval for iteration_until_bash in milliseconds. Defaults to 5000. */
+    iteration_until_bash_poll_ms: z.number().int().positive().optional(),
     /** When true, pause between iterations for user input via /workflow approve. */
     interactive: z.boolean().optional(),
     /** Message shown to user when paused (required when interactive is true). */

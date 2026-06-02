@@ -23,6 +23,20 @@ export const STEP_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
 /** Sentinel value to distinguish idle timeout from normal generator completion */
 const IDLE_TIMEOUT_SENTINEL = Symbol('IDLE_TIMEOUT');
+const EXTERNAL_COMPLETION_SENTINEL = Symbol('EXTERNAL_COMPLETION');
+
+export interface IdleTimeoutOptions {
+  /**
+   * Optional external completion check. When it returns true while the wrapped
+   * generator is silent, the wrapper returns normally without waiting for
+   * timeoutMs.
+   */
+  completionCheck?: () => boolean | Promise<boolean>;
+  /** Poll interval for completionCheck. Defaults to 5 seconds. */
+  completionCheckIntervalMs?: number;
+  /** Called once when completionCheck returns true. */
+  onCompletion?: () => void;
+}
 
 /**
  * Wraps an async generator with an idle timeout. If no value is yielded within
@@ -48,9 +62,11 @@ export async function* withIdleTimeout<T>(
   generator: AsyncGenerator<T>,
   timeoutMs: number,
   onTimeout?: () => void,
-  shouldResetTimer?: (value: T) => boolean
+  shouldResetTimer?: (value: T) => boolean,
+  options?: IdleTimeoutOptions
 ): AsyncGenerator<T> {
   let timedOut = false;
+  let completedExternally = false;
   let timerStartedAt = Date.now();
 
   try {
@@ -59,17 +75,48 @@ export async function* withIdleTimeout<T>(
       const remaining = Math.max(0, timeoutMs - elapsed);
 
       let timer: ReturnType<typeof setTimeout> | undefined;
+      let completionInterval: ReturnType<typeof setInterval> | undefined;
+      let completionCheckInFlight = false;
       const timeoutPromise = new Promise<typeof IDLE_TIMEOUT_SENTINEL>(resolve => {
         timer = setTimeout(() => {
           resolve(IDLE_TIMEOUT_SENTINEL);
         }, remaining);
       });
+      const completionPromise = options?.completionCheck
+        ? new Promise<typeof EXTERNAL_COMPLETION_SENTINEL>(resolve => {
+            const runCompletionCheck = (): void => {
+              if (completionCheckInFlight) return;
+              completionCheckInFlight = true;
+              Promise.resolve(options.completionCheck?.())
+                .then(complete => {
+                  if (complete) resolve(EXTERNAL_COMPLETION_SENTINEL);
+                })
+                .catch(() => {
+                  // A failed completion check means "not complete yet"; callers
+                  // still run their normal post-iteration checks and logging.
+                })
+                .finally(() => {
+                  completionCheckInFlight = false;
+                });
+            };
+            completionInterval = setInterval(
+              runCompletionCheck,
+              options.completionCheckIntervalMs ?? 5_000
+            );
+            runCompletionCheck();
+          })
+        : undefined;
 
       // Start waiting for the next value from the generator
       const nextPromise = generator.next();
 
-      const result = await Promise.race([nextPromise, timeoutPromise]);
+      const result = await Promise.race(
+        completionPromise
+          ? [nextPromise, timeoutPromise, completionPromise]
+          : [nextPromise, timeoutPromise]
+      );
       clearTimeout(timer);
+      if (completionInterval) clearInterval(completionInterval);
 
       if (result === IDLE_TIMEOUT_SENTINEL) {
         timedOut = true;
@@ -78,6 +125,15 @@ export async function* withIdleTimeout<T>(
           // Intentional: swallow rejection from aborted subprocess
         });
         onTimeout?.();
+        return;
+      }
+
+      if (result === EXTERNAL_COMPLETION_SENTINEL) {
+        completedExternally = true;
+        nextPromise.catch((_err: unknown) => {
+          // Intentional: swallow rejection from aborted subprocess.
+        });
+        options?.onCompletion?.();
         return;
       }
 
@@ -91,7 +147,7 @@ export async function* withIdleTimeout<T>(
       yield result.value;
     }
   } finally {
-    if (!timedOut) {
+    if (!timedOut && !completedExternally) {
       // Normal exit (generator exhausted or consumer broke out) — safe to clean up
       try {
         await generator.return(undefined as never);
@@ -112,5 +168,7 @@ export async function* withIdleTimeout<T>(
     // If timed out, don't call generator.return() — it would hang on the pending .next()
     // The onTimeout callback aborts the subprocess, which causes the pending .next()
     // to reject (caught by nextPromise.catch above) and the generator to finalize
+    // External completion has the same pending-next shape: onCompletion aborts
+    // the subprocess, so generator.return() would risk blocking.
   }
 }

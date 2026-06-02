@@ -5177,6 +5177,84 @@ describe('executeDagWorkflow -- break after result (no hang on subprocess exit)'
 
     expect(result).toBe('completed');
   });
+
+  it('loop node stops a silent provider when iteration_until_bash succeeds', async () => {
+    const artifactsDir = join(testDir, 'artifacts');
+    await mkdir(artifactsDir, { recursive: true });
+    const markerPath = join(artifactsDir, 'iteration-done');
+
+    mockSendQueryDag.mockImplementation(async function* (
+      _prompt: string,
+      _cwd: string,
+      _resumeSessionId?: string,
+      options?: { abortSignal?: AbortSignal }
+    ) {
+      setTimeout(() => {
+        void writeFile(markerPath, 'done');
+      }, 50);
+      await new Promise<void>(resolve => {
+        if (options?.abortSignal?.aborted) {
+          resolve();
+        } else {
+          options?.abortSignal?.addEventListener('abort', () => resolve(), { once: true });
+        }
+      });
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    const result = await Promise.race([
+      executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'loop-iteration-until-bash-test',
+          nodes: [
+            {
+              id: 'loop1',
+              loop: {
+                prompt: 'Do one durable transition.',
+                until: 'COMPLETE',
+                max_iterations: 3,
+                interactive: true,
+                gate_message: 'continue',
+                iteration_until_bash: 'test -f "$ARTIFACTS_DIR/iteration-done"',
+                iteration_until_bash_poll_ms: 25,
+              },
+              idle_timeout: 10_000,
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        artifactsDir,
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      ).then(() => 'completed'),
+      new Promise<string>((_, reject) =>
+        setTimeout(
+          () => reject(new Error('Timed out — iteration_until_bash did not stop the provider')),
+          3_000
+        )
+      ),
+    ]);
+
+    expect(result).toBe('completed');
+    expect(store.failWorkflowRun).not.toHaveBeenCalled();
+    expect(store.pauseWorkflowRun).toHaveBeenCalled();
+    const sentMessages = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(
+      (c: unknown[]) => c[1] as string
+    );
+    expect(sentMessages.some(m => m.includes('completed via iteration_until_bash'))).toBe(true);
+  });
 });
 
 describe('executeDagWorkflow -- terminal node output selection', () => {

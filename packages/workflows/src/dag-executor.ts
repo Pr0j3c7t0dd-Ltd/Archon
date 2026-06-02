@@ -1270,10 +1270,74 @@ async function executeNodeInternal(
 
 /** Default timeout for subprocess nodes (bash, script): 2 minutes */
 const SUBPROCESS_DEFAULT_TIMEOUT = 120_000;
+const LOOP_ITERATION_CHECK_INTERVAL_MS = 5_000;
 
 /** Threshold (bytes) above which $nodeId.output values are written to a temp file
  *  instead of inlined as bash -c arguments, to avoid silent data corruption. */
 const NODE_OUTPUT_FILE_THRESHOLD = 32_768;
+
+interface LoopBashConditionOptions {
+  script: string;
+  workflowRun: WorkflowRun;
+  cwd: string;
+  artifactsDir: string;
+  baseBranch: string;
+  docsDir: string;
+  issueContext?: string;
+  loopUserInput: string;
+  loopPrevOutput: string;
+  nodeOutputs: Map<string, NodeOutput>;
+  logDir: string;
+}
+
+async function evaluateLoopBashCondition(options: LoopBashConditionOptions): Promise<boolean> {
+  const { prompt: bashPrompt } = substituteWorkflowVariables(
+    options.script,
+    options.workflowRun.id,
+    options.workflowRun.user_message,
+    options.artifactsDir,
+    options.baseBranch,
+    options.docsDir,
+    options.issueContext,
+    options.loopUserInput,
+    undefined,
+    options.loopPrevOutput,
+    { shellSafe: true }
+  );
+  const substitutedBash = substituteNodeOutputRefs(
+    bashPrompt,
+    options.nodeOutputs,
+    true,
+    options.logDir
+  );
+
+  try {
+    await execFileAsync('bash', ['-c', substitutedBash], {
+      cwd: options.cwd,
+      timeout: SUBPROCESS_DEFAULT_TIMEOUT,
+      env: {
+        ...process.env,
+        USER_MESSAGE: options.workflowRun.user_message,
+        ARGUMENTS: options.workflowRun.user_message,
+        LOOP_USER_INPUT: options.loopUserInput,
+        LOOP_PREV_OUTPUT: options.loopPrevOutput,
+        REJECTION_REASON: '',
+        CONTEXT: options.issueContext ?? '',
+        EXTERNAL_CONTEXT: options.issueContext ?? '',
+        ISSUE_CONTEXT: options.issueContext ?? '',
+      },
+    });
+    return true;
+  } catch (e) {
+    const bashErr = e as NodeJS.ErrnoException;
+    if (bashErr.code === 'ENOENT') {
+      getLog().warn({ err: bashErr }, 'loop_node.bash_condition_exec_error');
+    } else if (typeof bashErr.code === 'string') {
+      getLog().warn({ err: bashErr }, 'loop_node.bash_condition_unexpected_error');
+    }
+    return false;
+  }
+}
 
 /**
  * Execute a bash (shell script) DAG node.
@@ -1873,6 +1937,7 @@ async function executeLoopNode(
     let fullOutput = ''; // raw, for signal detection
     let cleanOutput = ''; // stripped, for platform display
     let iterationIdleTimedOut = false;
+    let iterationExternallyCompleted = false;
     const iterationAbortController = new AbortController();
 
     try {
@@ -1896,6 +1961,8 @@ async function executeLoopNode(
         i === startIteration ? '' : lastIterationOutput
       );
       const finalPrompt = substituteNodeOutputRefs(substitutedPrompt, nodeOutputs);
+      const loopInputForIteration = i === startIteration ? (loopUserInput ?? '') : '';
+      const loopPrevOutputForIteration = i === startIteration ? '' : lastIterationOutput;
 
       const iterationOptions: SendQueryOptions | undefined = {
         ...resolvedOptions,
@@ -1907,14 +1974,49 @@ async function executeLoopNode(
 
       const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
 
-      for await (const msg of withIdleTimeout(generator, effectiveIdleTimeout, () => {
-        iterationIdleTimedOut = true;
-        getLog().warn(
-          { nodeId: node.id, iteration: i, timeoutMs: effectiveIdleTimeout },
-          'loop_node.idle_timeout_reached'
-        );
-        iterationAbortController.abort();
-      })) {
+      const iterationUntilBash = loop.iteration_until_bash;
+
+      for await (const msg of withIdleTimeout(
+        generator,
+        effectiveIdleTimeout,
+        () => {
+          iterationIdleTimedOut = true;
+          getLog().warn(
+            { nodeId: node.id, iteration: i, timeoutMs: effectiveIdleTimeout },
+            'loop_node.idle_timeout_reached'
+          );
+          iterationAbortController.abort();
+        },
+        undefined,
+        iterationUntilBash
+          ? {
+              completionCheck: () =>
+                evaluateLoopBashCondition({
+                  script: iterationUntilBash,
+                  workflowRun,
+                  cwd,
+                  artifactsDir,
+                  baseBranch,
+                  docsDir,
+                  issueContext,
+                  loopUserInput: loopInputForIteration,
+                  loopPrevOutput: loopPrevOutputForIteration,
+                  nodeOutputs,
+                  logDir,
+                }),
+              completionCheckIntervalMs:
+                loop.iteration_until_bash_poll_ms ?? LOOP_ITERATION_CHECK_INTERVAL_MS,
+              onCompletion: (): void => {
+                iterationExternallyCompleted = true;
+                getLog().info(
+                  { nodeId: node.id, iteration: i },
+                  'loop_node.iteration_until_bash_complete'
+                );
+                iterationAbortController.abort();
+              },
+            }
+          : undefined
+      )) {
         if (msg.type === 'assistant') {
           fullOutput += msg.content;
           const cleaned = stripCompletionTags(msg.content, loop.until);
@@ -2096,6 +2198,13 @@ async function executeLoopNode(
         `Loop node '${node.id}' iteration ${String(i)} completed via idle timeout (no output for ${String((node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS) / 60000)} min)`,
         msgContext
       );
+    } else if (iterationExternallyCompleted) {
+      await safeSendMessage(
+        platform,
+        conversationId,
+        `Loop node '${node.id}' iteration ${String(i)} completed via iteration_until_bash`,
+        msgContext
+      );
     }
 
     // Empty assistant output is an iteration failure for AI loops — same
@@ -2106,7 +2215,7 @@ async function executeLoopNode(
     // budget producing nothing. Idle-timeout exits are exempt — the
     // notification above has already told the user the iteration completed
     // via timeout, and flipping that to a failure would contradict it.
-    if (!iterationIdleTimedOut && fullOutput.trim() === '') {
+    if (!iterationIdleTimedOut && !iterationExternallyCompleted && fullOutput.trim() === '') {
       const iterationDuration = Date.now() - iterationStart;
       const emptyError =
         'Loop iteration produced no assistant output. The provider stream closed without yielding content — likely a silent provider rejection or stream interruption.';
@@ -2161,41 +2270,19 @@ async function executeLoopNode(
     let bashComplete = false;
     if (loop.until_bash) {
       try {
-        const { prompt: bashPrompt } = substituteWorkflowVariables(
-          loop.until_bash,
-          workflowRun.id,
-          workflowRun.user_message,
+        bashComplete = await evaluateLoopBashCondition({
+          script: loop.until_bash,
+          workflowRun,
+          cwd,
           artifactsDir,
           baseBranch,
           docsDir,
           issueContext,
-          undefined,
-          undefined,
-          undefined,
-          { shellSafe: true }
-        );
-        const substitutedBash = substituteNodeOutputRefs(
-          bashPrompt,
+          loopUserInput: i === startIteration ? (loopUserInput ?? '') : '',
+          loopPrevOutput: prevIterationOutput,
           nodeOutputs,
-          true, // escapedForBash
-          logDir
-        );
-        await execFileAsync('bash', ['-c', substitutedBash], {
-          cwd,
-          timeout: SUBPROCESS_DEFAULT_TIMEOUT,
-          env: {
-            ...process.env,
-            USER_MESSAGE: workflowRun.user_message,
-            ARGUMENTS: workflowRun.user_message,
-            LOOP_USER_INPUT: i === startIteration ? (loopUserInput ?? '') : '',
-            LOOP_PREV_OUTPUT: prevIterationOutput,
-            REJECTION_REASON: '',
-            CONTEXT: issueContext ?? '',
-            EXTERNAL_CONTEXT: issueContext ?? '',
-            ISSUE_CONTEXT: issueContext ?? '',
-          },
+          logDir,
         });
-        bashComplete = true; // exit 0 = complete
       } catch (e) {
         const bashErr = e as NodeJS.ErrnoException;
         // ENOENT or other system errors are unexpected — log them

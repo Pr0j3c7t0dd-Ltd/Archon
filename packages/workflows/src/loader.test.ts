@@ -2305,6 +2305,8 @@ nodes:
       max_iterations: 10
       fresh_context: true
       until_bash: "test -f done.txt"
+      iteration_until_bash: "test -f iteration-done.txt"
+      iteration_until_bash_poll_ms: 250
     idle_timeout: 300000
 `
       );
@@ -2324,6 +2326,8 @@ nodes:
         expect(wf.nodes[0].loop.max_iterations).toBe(10);
         expect(wf.nodes[0].loop.fresh_context).toBe(true);
         expect(wf.nodes[0].loop.until_bash).toBe('test -f done.txt');
+        expect(wf.nodes[0].loop.iteration_until_bash).toBe('test -f iteration-done.txt');
+        expect(wf.nodes[0].loop.iteration_until_bash_poll_ms).toBe(250);
         expect(wf.nodes[0].idle_timeout).toBe(300000);
       }
     });
@@ -2354,6 +2358,8 @@ nodes:
       if (isLoopNode(wf.nodes[0])) {
         expect(wf.nodes[0].loop.fresh_context).toBe(false);
         expect(wf.nodes[0].loop.until_bash).toBeUndefined();
+        expect(wf.nodes[0].loop.iteration_until_bash).toBeUndefined();
+        expect(wf.nodes[0].loop.iteration_until_bash_poll_ms).toBeUndefined();
       }
     });
 
