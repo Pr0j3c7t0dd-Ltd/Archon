@@ -1947,6 +1947,9 @@ async function executeLoopNode(
     let iterationIdleTimedOut = false;
     let iterationExternallyCompleted = false;
     const iterationAbortController = new AbortController();
+    let iterationUntilBash: string | undefined;
+    let loopInputForIteration = '';
+    let loopPrevOutputForIteration = '';
 
     try {
       // Build prompt — substituteWorkflowVariables throws if $BASE_BRANCH referenced but empty
@@ -1969,8 +1972,8 @@ async function executeLoopNode(
         i === startIteration ? '' : lastIterationOutput
       );
       const finalPrompt = substituteNodeOutputRefs(substitutedPrompt, nodeOutputs);
-      const loopInputForIteration = i === startIteration ? (loopUserInput ?? '') : '';
-      const loopPrevOutputForIteration = i === startIteration ? '' : lastIterationOutput;
+      loopInputForIteration = i === startIteration ? (loopUserInput ?? '') : '';
+      loopPrevOutputForIteration = i === startIteration ? '' : lastIterationOutput;
 
       const iterationOptions: SendQueryOptions | undefined = {
         ...resolvedOptions,
@@ -1982,7 +1985,8 @@ async function executeLoopNode(
 
       const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
 
-      const iterationUntilBash = loop.iteration_until_bash;
+      iterationUntilBash = loop.iteration_until_bash;
+      const iterationUntilBashScript = iterationUntilBash;
 
       for await (const msg of withIdleTimeout(
         generator,
@@ -1996,11 +2000,11 @@ async function executeLoopNode(
           iterationAbortController.abort();
         },
         undefined,
-        iterationUntilBash
+        iterationUntilBashScript
           ? {
               completionCheck: () =>
                 evaluateLoopBashCondition({
-                  script: iterationUntilBash,
+                  script: iterationUntilBashScript,
                   workflowRun,
                   cwd,
                   artifactsDir,
@@ -2200,6 +2204,37 @@ async function executeLoopNode(
       };
     }
 
+    if (iterationIdleTimedOut && !iterationExternallyCompleted && iterationUntilBash) {
+      try {
+        iterationExternallyCompleted = await evaluateLoopBashCondition({
+          script: iterationUntilBash,
+          workflowRun,
+          cwd,
+          artifactsDir,
+          baseBranch,
+          docsDir,
+          issueContext,
+          loopUserInput: loopInputForIteration,
+          loopPrevOutput: loopPrevOutputForIteration,
+          loopIteration: i,
+          loopIterationStartedAtMs: iterationStart,
+          nodeOutputs,
+          logDir,
+        });
+        if (iterationExternallyCompleted) {
+          getLog().info(
+            { nodeId: node.id, iteration: i },
+            'loop_node.iteration_until_bash_complete_after_idle_timeout'
+          );
+        }
+      } catch (e) {
+        getLog().warn(
+          { err: e as Error, nodeId: node.id, iteration: i },
+          'loop_node.iteration_until_bash_after_idle_timeout_error'
+        );
+      }
+    }
+
     // Notify on idle timeout
     if (iterationIdleTimedOut && fullOutput.trim() === '') {
       await safeSendMessage(
@@ -2222,6 +2257,44 @@ async function executeLoopNode(
         `Loop node '${node.id}' iteration ${String(i)} completed via iteration_until_bash`,
         msgContext
       );
+    }
+
+    if (iterationIdleTimedOut && !iterationExternallyCompleted) {
+      const iterationDuration = Date.now() - iterationStart;
+      const idleError =
+        'Loop iteration hit idle timeout before deterministic completion. The provider may have been working silently, but durable state did not advance before the subprocess was aborted.';
+      getLog().error(
+        { nodeId: node.id, iteration: i, durationMs: iterationDuration },
+        'loop_node.iteration_idle_timeout_without_completion'
+      );
+      getWorkflowEventEmitter().emit({
+        type: 'loop_iteration_failed',
+        runId: workflowRun.id,
+        nodeId: node.id,
+        iteration: i,
+        error: idleError,
+      });
+      deps.store
+        .createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: 'loop_iteration_failed',
+          step_name: node.id,
+          data: {
+            iteration: i,
+            error: idleError,
+            duration: iterationDuration,
+            nodeId: node.id,
+          },
+        })
+        .catch((evtErr: Error) => {
+          logEventStoreError(evtErr, i);
+        });
+      return {
+        state: 'failed',
+        output: cleanOutput || fullOutput,
+        error: `Loop iteration ${i} failed: ${idleError}`,
+        costUsd: loopTotalCostUsd,
+      };
     }
 
     // Empty assistant output is an iteration failure for AI loops — same
