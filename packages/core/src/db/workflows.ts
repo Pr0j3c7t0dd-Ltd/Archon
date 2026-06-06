@@ -326,7 +326,7 @@ export async function findResumableRun(
          )
        ORDER BY started_at DESC
        LIMIT 1`,
-      [workflowName, workingPath, 1]
+      [workflowName, workingPath]
     );
     const row = result.rows[0];
     return row ? normalizeWorkflowRun(row) : null;

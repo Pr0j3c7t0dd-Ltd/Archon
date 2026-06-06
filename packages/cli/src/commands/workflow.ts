@@ -63,6 +63,8 @@ export interface WorkflowRunOptions {
   fromBranch?: string;
   noWorktree?: boolean;
   resume?: boolean;
+  /** Resume this exact run instead of searching by workflow/path. Used after approvals. */
+  resumeRunId?: string;
   codebaseId?: string; // Skips path-based codebase lookup when resume/approve/reject already resolved it
   /**
    * Override the directory used for workflow YAML discovery.
@@ -475,7 +477,28 @@ export async function workflowRunCommand(
       );
     }
 
-    resumable = await workflowDb.findResumableRun(workflowName, cwd);
+    if (options.resumeRunId) {
+      resumable = await workflowDb.getWorkflowRun(options.resumeRunId);
+      if (!resumable) {
+        throw new Error(`No workflow run found for resume id '${options.resumeRunId}'.`);
+      }
+      if (resumable.workflow_name !== workflowName) {
+        throw new Error(
+          `Cannot resume run '${options.resumeRunId}': expected workflow '${workflowName}', got '${resumable.workflow_name}'.`
+        );
+      }
+      if (
+        resumable.status !== 'failed' &&
+        resumable.status !== 'paused' &&
+        resumable.status !== 'running'
+      ) {
+        throw new Error(
+          `Cannot resume run '${options.resumeRunId}' with status '${resumable.status}'.`
+        );
+      }
+    } else {
+      resumable = await workflowDb.findResumableRun(workflowName, cwd);
+    }
 
     if (!resumable) {
       throw new Error(`No resumable run found for workflow '${workflowName}' at path '${cwd}'.`);
@@ -1142,6 +1165,7 @@ export async function workflowApproveCommand(runId: string, comment?: string): P
   try {
     await workflowRunCommand(result.workingPath, result.workflowName, result.userMessage ?? '', {
       resume: true,
+      resumeRunId: runId,
       codebaseId: result.codebaseId ?? undefined,
       conversationId: platformConversationId,
       discoveryCwd,
@@ -1230,6 +1254,7 @@ export async function workflowRejectCommand(runId: string, reason?: string): Pro
   try {
     await workflowRunCommand(result.workingPath, result.workflowName, result.userMessage ?? '', {
       resume: true,
+      resumeRunId: runId,
       codebaseId: result.codebaseId ?? undefined,
       conversationId: platformConversationId,
       discoveryCwd,

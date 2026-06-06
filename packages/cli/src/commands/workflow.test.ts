@@ -120,6 +120,7 @@ mock.module('@archon/core/db/codebases', () => ({
 
 mock.module('@archon/core/db/isolation-environments', () => ({
   findActiveByWorkflow: mock(() => Promise.resolve(null)),
+  listByCodebase: mock(() => Promise.resolve([])),
   create: mock(() => Promise.resolve({ id: 'iso-123' })),
 }));
 
@@ -996,6 +997,65 @@ describe('workflowRunCommand', () => {
       'Remove the stale workspace entry at /home/test/.archon/workspaces/acme/widget and retry'
     );
     expect(error.message).not.toContain('Not in a git repository');
+  });
+
+  it('uses an exact run id for resume when resumeRunId is provided', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const executor = await import('@archon/workflows/executor');
+    const conversationDb = await import('@archon/core/db/conversations');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const workflowDb = await import('@archon/core/db/workflows');
+
+    const exactRun = {
+      id: 'run-exact',
+      workflow_name: 'assist',
+      status: 'failed',
+      user_message: 'continue dev loop',
+      working_path: '/tmp',
+      codebase_id: 'cb-123',
+      metadata: {
+        approval: { type: 'interactive_loop', nodeId: 'controller', iteration: 3 },
+        loop_user_input: 'approved',
+      },
+    };
+
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Help' })],
+      errors: [],
+    });
+    (conversationDb.getOrCreateConversation as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'conv-123',
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-123',
+      default_cwd: '/tmp',
+    });
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce(exactRun);
+    (workflowDb.findResumableRun as ReturnType<typeof mock>).mockClear();
+    (executor.hydrateResumableRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      preCreatedRun: { ...exactRun, status: 'running' },
+      priorCompletedNodes: new Map(),
+    });
+    (executor.executeWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+      success: true,
+      workflowRunId: 'run-exact',
+    });
+
+    await workflowRunCommand('/tmp', 'assist', 'continue dev loop', {
+      resume: true,
+      resumeRunId: 'run-exact',
+      codebaseId: 'cb-123',
+    });
+
+    expect(workflowDb.getWorkflowRun).toHaveBeenCalledWith('run-exact');
+    expect(workflowDb.findResumableRun).not.toHaveBeenCalled();
+    expect(executor.hydrateResumableRun).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        id: 'run-exact',
+        metadata: expect.objectContaining({ loop_user_input: 'approved' }),
+      })
+    );
   });
 
   it('falls back to generic workspace hint when registration error has an unrecognized shape', async () => {
