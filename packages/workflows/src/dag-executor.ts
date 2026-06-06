@@ -2479,7 +2479,8 @@ async function executeLoopNode(
       const gateMsg =
         `\u23f8 **Input required** (loop \`${node.id}\`, iteration ${String(i)}): ${loop.gate_message}\n\n` +
         `Run ID: \`${workflowRun.id}\`\n` +
-        `Respond: \`/workflow approve ${workflowRun.id} <your feedback>\` | Cancel: \`/workflow reject ${workflowRun.id}\``;
+        `Chat respond: \`/workflow approve ${workflowRun.id} <your feedback>\` | Cancel: \`/workflow reject ${workflowRun.id}\`\n` +
+        `Terminal resume: \`archon workflow approve ${workflowRun.id} "<your feedback>"\``;
       const gateSent = await safeSendMessage(platform, conversationId, gateMsg, {
         workflowId: workflowRun.id,
         nodeName: node.id,
@@ -2690,7 +2691,8 @@ async function executeApprovalNode(
   const approvalMsg =
     `⏸ **Approval required**: ${renderedMessage}\n\n` +
     `Run ID: \`${workflowRun.id}\`\n` +
-    `Approve: \`/workflow approve ${workflowRun.id}\` | Reject: \`/workflow reject ${workflowRun.id}\``;
+    `Chat approve: \`/workflow approve ${workflowRun.id}\` | Reject: \`/workflow reject ${workflowRun.id}\`\n` +
+    `Terminal approve: \`archon workflow approve ${workflowRun.id}\``;
   await safeSendMessage(platform, conversationId, approvalMsg, msgContext);
 
   deps.store

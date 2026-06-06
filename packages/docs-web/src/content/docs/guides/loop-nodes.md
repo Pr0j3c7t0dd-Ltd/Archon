@@ -268,9 +268,9 @@ completion when tests still fail.
 Set `interactive: true` to pause the loop between iterations and wait for human input.
 After each non-completing iteration the executor:
 
-1. Sends the `gate_message` to the user along with the run ID and a `/workflow approve` command
+1. Sends the `gate_message` to the user along with the run ID, a chat `/workflow approve` command, and the terminal `archon workflow approve` command
 2. Pauses the workflow run
-3. Waits — the workflow resumes when the user runs `/workflow approve <id> <feedback>`
+3. Waits — in chat, the workflow resumes when the user runs `/workflow approve <id> <feedback>` and sends the next message; in terminal monitoring, `archon workflow approve <id> "<feedback>"` records the input and resumes immediately
 
 The user's feedback is injected into the next iteration's prompt via `$LOOP_USER_INPUT`.
 
