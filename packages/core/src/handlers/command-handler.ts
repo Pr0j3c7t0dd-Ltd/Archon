@@ -630,12 +630,22 @@ async function handleWorkflowCommand(
     }
 
     case 'cancel': {
+      const runId = args[1];
       try {
+        if (runId) {
+          const run = await abandonWorkflow(runId);
+          return {
+            success: true,
+            message: `Cancelled workflow run \`${run.workflow_name}\` (${runId})`,
+          };
+        }
+
         const activeWorkflow = await workflowDb.getActiveWorkflowRun(conversation.id);
         if (!activeWorkflow) {
           return {
             success: true,
-            message: 'No active workflow to cancel.',
+            message:
+              'No active workflow to cancel. Use `/workflow status` to list running and paused runs, then `/workflow cancel <id>` to cancel one by id.',
           };
         }
 
@@ -646,8 +656,14 @@ async function handleWorkflowCommand(
         };
       } catch (error) {
         const err = error as Error;
-        getLog().error({ err, conversationId: conversation.id }, 'cmd.workflow_cancel_failed');
-        return { success: false, message: 'Failed to cancel workflow. Please try again.' };
+        getLog().error(
+          { err, conversationId: conversation.id, runId },
+          'cmd.workflow_cancel_failed'
+        );
+        return {
+          success: false,
+          message: `Failed to cancel workflow${runId ? ` run ${runId}` : ''}: ${err.message}`,
+        };
       }
     }
 
@@ -669,10 +685,10 @@ async function handleWorkflowCommand(
 
         const hasRunning = activeRuns.some(r => r.status === 'running');
         const hasPaused = activeRuns.some(r => r.status === 'paused');
-        if (hasRunning) msg += 'Use `/workflow cancel` to stop a running workflow.';
+        if (hasRunning) msg += 'Use `/workflow cancel <id>` to stop a running workflow by id.';
         if (hasPaused)
           msg +=
-            '\nUse `/workflow approve <id>` or `/workflow reject <id> <reason>` for paused runs.';
+            '\nUse `/workflow approve <id>`, `/workflow reject <id> <reason>`, or `/workflow cancel <id>` for paused runs.';
         return { success: true, message: msg.trim() };
       } catch (error) {
         const err = error as Error;
@@ -914,7 +930,7 @@ async function handleWorkflowCommand(
       return {
         success: false,
         message:
-          'Usage:\n  /workflow list - Show available workflows\n  /workflow reload - Reload workflow definitions\n  /workflow status - Show all active workflows\n  /workflow cancel - Cancel running workflow\n  /workflow resume <id> - Resume a failed run\n  /workflow abandon <id> - Discard a failed run\n  /workflow approve <id> [comment] - Approve a paused run\n  /workflow reject <id> [reason] - Reject a paused run\n  /workflow reset-sessions <name> [<node-id>] - Clear persisted AI session memory for this conversation\n  /workflow run <name> [args] - Run a workflow directly',
+          'Usage:\n  /workflow list - Show available workflows\n  /workflow reload - Reload workflow definitions\n  /workflow status - Show all active workflows\n  /workflow cancel [id] - Cancel the active workflow, or a running/paused workflow by id\n  /workflow resume <id> - Resume a failed run\n  /workflow abandon <id> - Discard a failed run\n  /workflow approve <id> [comment] - Approve a paused run\n  /workflow reject <id> [reason] - Reject a paused run\n  /workflow reset-sessions <name> [<node-id>] - Clear persisted AI session memory for this conversation\n  /workflow run <name> [args] - Run a workflow directly',
       };
   }
 }
@@ -944,7 +960,7 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
 - \`/workflow list\` — List available workflows
 - \`/workflow run <name> [message]\` — Run a workflow explicitly
 - \`/workflow status\` — Show all active workflows
-- \`/workflow cancel\` — Cancel the active workflow
+- \`/workflow cancel [id]\` — Cancel the active workflow, or a running/paused workflow by id
 - \`/workflow resume <id>\` — Resume a failed run
 - \`/workflow abandon <id>\` — Discard a failed run
 - \`/workflow approve <id>\` — Approve a paused run

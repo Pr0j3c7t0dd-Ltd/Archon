@@ -1309,13 +1309,42 @@ describe('CommandHandler', () => {
         expect(mockCancelWorkflowRun).toHaveBeenCalledWith('wf-123');
       });
 
+      test('should cancel explicit running or paused workflow id', async () => {
+        mockGetWorkflowRun.mockResolvedValueOnce({
+          id: 'wf-paused-123',
+          workflow_name: 'paused-workflow',
+          conversation_id: 'other-conv',
+          parent_conversation_id: null,
+          codebase_id: 'codebase-123',
+          status: 'paused' as const,
+          user_message: 'test',
+          metadata: {},
+          started_at: new Date(),
+          completed_at: null,
+          last_activity_at: null,
+          working_path: '/workspace/test-repo',
+        });
+
+        const result = await handleCommand(
+          conversationWithCodebase,
+          '/workflow cancel wf-paused-123'
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.message).toContain('Cancelled workflow run');
+        expect(result.message).toContain('paused-workflow');
+        expect(mockGetActiveWorkflowRun).not.toHaveBeenCalled();
+        expect(mockCancelWorkflowRun).toHaveBeenCalledWith('wf-paused-123');
+      });
+
       test('should return message when no active workflow exists', async () => {
         mockGetActiveWorkflowRun.mockResolvedValueOnce(null);
 
         const result = await handleCommand(conversationWithCodebase, '/workflow cancel');
 
         expect(result.success).toBe(true);
-        expect(result.message).toBe('No active workflow to cancel.');
+        expect(result.message).toContain('No active workflow to cancel.');
+        expect(result.message).toContain('/workflow cancel <id>');
         expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
       });
 
@@ -1323,7 +1352,7 @@ describe('CommandHandler', () => {
         const result = await handleCommand(baseConversation, '/workflow cancel');
 
         expect(result.success).toBe(true);
-        expect(result.message).toBe('No active workflow to cancel.');
+        expect(result.message).toContain('No active workflow to cancel.');
       });
     });
 
@@ -1353,6 +1382,7 @@ describe('CommandHandler', () => {
         expect(result.message).toContain('implement');
         expect(result.message).toContain('run-abc123');
         expect(result.message).toContain('/workspace/worktrees/feat-auth');
+        expect(result.message).toContain('/workflow cancel <id>');
       });
 
       test('should show no-active message when no workflows running', async () => {
