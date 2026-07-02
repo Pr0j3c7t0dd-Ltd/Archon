@@ -31,7 +31,7 @@
     "@earendil-works/pi-ai": "^0.76.0",
     "@earendil-works/pi-coding-agent": "^0.76.0",
     "@opencode-ai/sdk": "^1.14.20",
-    "@openai/codex-sdk": "^0.125.0",
+    "@openai/codex-sdk": "^0.142.0",
     "@sinclair/typebox": "^0.34.41"
   },
   "devDependencies": {
