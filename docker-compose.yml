@@ -81,6 +81,10 @@ services:
       - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     networks:
       - archon-network
+    # Match the app's policy: without this, a Docker daemon restart brings the
+    # app back but leaves postgres down, and the app crash-loops on
+    # getaddrinfo ENOTFOUND for the `postgres` hostname.
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
