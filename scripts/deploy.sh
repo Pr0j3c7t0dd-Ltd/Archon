@@ -272,21 +272,26 @@ deploy_local() {
     bun run validate
   fi
 
+  # Build the web UI and its release-format archive before compiling the binary.
+  # The binary embeds this archive's checksum, even when the matching web files
+  # are also staged locally below.
+  info "Building web UI"
+  bun run build:web
+  local web_src="$REPO_ROOT/packages/web/dist"
+  [[ -f "$web_src/index.html" ]] || die "Web build missing: $web_src/index.html"
+  local web_archive="$REPO_ROOT/dist/archon-web.tar.gz"
+  mkdir -p "$(dirname "$web_archive")"
+  tar -czf "$web_archive" -C "$web_src" .
+
   # Build the binary for THIS platform only (the multi-target default is slow)
   local target_bin out_file
   target_bin="bun-${PLATFORM_OS}-${PLATFORM_ARCH}"
   out_file="dist/binaries/archon-${PLATFORM_OS}-${PLATFORM_ARCH}"
   info "Building CLI binary: ${out_file}"
   mkdir -p dist/binaries
-  TARGET="${target_bin}" OUTFILE="${out_file}" bun run build:binaries
+  TARGET="${target_bin}" OUTFILE="${out_file}" WEB_DIST_ARCHIVE="${web_archive}" bun run build:binaries
 
   [[ -x "$out_file" ]] || die "Binary missing or not executable: $out_file"
-
-  # Build the web UI
-  info "Building web UI"
-  bun run build:web
-  local web_src="$REPO_ROOT/packages/web/dist"
-  [[ -f "$web_src/index.html" ]] || die "Web build missing: $web_src/index.html"
 
   # Install the binary at the canonical path used by the curl installer.
   info "Installing binary to ${INSTALL_PATH} (sudo may prompt)"

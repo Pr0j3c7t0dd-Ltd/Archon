@@ -11,6 +11,7 @@
 #   GIT_COMMIT - short git commit (default: from `git rev-parse --short HEAD`)
 #   TARGET     - bun target triple (e.g. bun-darwin-arm64); CI mode
 #   OUTFILE    - output path for the built binary; CI mode
+#   WEB_DIST_ARCHIVE - path to the web dist archive (default: archon-web.tar.gz)
 
 set -euo pipefail
 
@@ -18,6 +19,7 @@ VERSION="${VERSION:-$(grep '"version"' package.json | head -1 | cut -d'"' -f4)}"
 GIT_COMMIT="${GIT_COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')}"
 TARGET="${TARGET:-}"
 OUTFILE="${OUTFILE:-}"
+WEB_DIST_ARCHIVE="${WEB_DIST_ARCHIVE:-archon-web.tar.gz}"
 
 echo "Building Archon CLI v${VERSION} (commit: ${GIT_COMMIT})"
 
@@ -45,13 +47,13 @@ is_valid_sha256() {
 }
 
 WEB_DIST_SHA256=""
-if [ -f "archon-web.tar.gz" ]; then
+if [ -f "$WEB_DIST_ARCHIVE" ]; then
   # `|| true` is intentional under `set -euo pipefail`: if shasum is missing or
   # the file is unreadable, we want WEB_DIST_SHA256 to land empty so the
   # is_valid_sha256 check below can decide between fail-closed (release/CI) and
   # warn-and-fallback (dev). Without this, pipefail would abort the script
   # before that policy check ever runs. Don't simplify away.
-  WEB_DIST_SHA256="$(shasum -a 256 archon-web.tar.gz 2>/dev/null | cut -d' ' -f1 || true)"
+  WEB_DIST_SHA256="$(shasum -a 256 "$WEB_DIST_ARCHIVE" 2>/dev/null | cut -d' ' -f1 || true)"
   if is_valid_sha256 "$WEB_DIST_SHA256"; then
     echo "Embedded web dist SHA-256: ${WEB_DIST_SHA256}"
   else
