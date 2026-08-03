@@ -2,13 +2,19 @@ import { describe, test, expect, beforeEach, afterEach, mock, spyOn, type Mock }
 import { writeFile, mkdir as realMkdir, rm } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir, homedir } from 'os';
+// Loaded BEFORE mock.module replaces the module in the registry, so these are
+// the REAL identity validators — the mock re-exports them (no drift possible).
+import { parseOwnerRepo, resolveRepoProjectIdentity } from '@archon/paths';
 
 // ---------------------------------------------------------------------------
 // Mock @archon/paths: suppress logger, pass-through path functions
 // ---------------------------------------------------------------------------
-// Re-implement the path helpers inline so the mock doesn't depend on the real
-// module (mock.module replaces the *entire* module).  The path functions are
-// trivial join() wrappers driven by env-vars, so duplication is acceptable.
+// Re-implement the *path* helpers inline so the mock doesn't depend on the
+// real module's env handling (mock.module replaces the *entire* module).  The
+// path functions are trivial join() wrappers driven by env-vars, so
+// duplication is acceptable.  The identity validators (parseOwnerRepo,
+// resolveRepoProjectIdentity) are pure, so the mock passes the real ones
+// through instead of mirroring them.
 // ---------------------------------------------------------------------------
 interface MockLogger {
   fatal: ReturnType<typeof mock>;
@@ -53,6 +59,8 @@ mock.module('@archon/paths', () => ({
   getArchonWorkspacesPath: () => join(getArchonHome(), 'workspaces'),
   getProjectWorktreesPath: (owner: string, repo: string) =>
     join(getArchonHome(), 'workspaces', owner, repo, 'worktrees'),
+  parseOwnerRepo,
+  resolveRepoProjectIdentity,
 }));
 
 // ---------------------------------------------------------------------------
@@ -196,15 +204,16 @@ describe('git utilities', () => {
 
     test('returns workspace-scoped base for a local non-workspace repo (via path fallback)', () => {
       // New-model invariant: every repo resolves to workspace-scoped. For a repo
-      // living outside ~/.archon/workspaces/, owner/repo is derived from the last
-      // two path segments (extractOwnerRepo) so the worktree base is still stable.
+      // living outside ~/.archon/workspaces/, the identity is the shared
+      // _local/<basename> fallback (resolveRepoProjectIdentity) — the same
+      // identity registration and log/artifact resolution use (#2227).
       delete process.env.WORKTREE_BASE;
       delete process.env.WORKSPACE_PATH;
       delete process.env.ARCHON_HOME;
       delete process.env.ARCHON_DOCKER;
       const result = git.getWorktreeBase('/workspace/my-repo');
       expect(result).toEqual({
-        base: join(homedir(), '.archon', 'workspaces', 'workspace', 'my-repo', 'worktrees'),
+        base: join(homedir(), '.archon', 'workspaces', '_local', 'my-repo', 'worktrees'),
         layout: 'workspace-scoped',
       });
     });
@@ -216,7 +225,7 @@ describe('git utilities', () => {
       process.env.ARCHON_HOME = '/custom/archon';
       const result = git.getWorktreeBase('/workspace/my-repo');
       expect(result).toEqual({
-        base: join('/custom/archon', 'workspaces', 'workspace', 'my-repo', 'worktrees'),
+        base: join('/custom/archon', 'workspaces', '_local', 'my-repo', 'worktrees'),
         layout: 'workspace-scoped',
       });
     });
@@ -226,7 +235,7 @@ describe('git utilities', () => {
       process.env.ARCHON_DOCKER = 'true';
       const result = git.getWorktreeBase('/workspace/my-repo');
       expect(result).toEqual({
-        base: join('/', '.archon', 'workspaces', 'workspace', 'my-repo', 'worktrees'),
+        base: join('/', '.archon', 'workspaces', '_local', 'my-repo', 'worktrees'),
         layout: 'workspace-scoped',
       });
     });
@@ -281,17 +290,67 @@ describe('git utilities', () => {
       });
     });
 
-    test('ignores invalid codebaseName and falls back to path-derived owner/repo', () => {
+    test('ignores invalid codebaseName and falls back to _local/<basename>', () => {
       // "invalid-no-slash" doesn't parse as owner/repo; the layout still resolves
-      // to workspace-scoped using the last two segments of the repoPath.
+      // to workspace-scoped using the shared _local/<basename> identity.
       delete process.env.WORKSPACE_PATH;
       delete process.env.ARCHON_DOCKER;
       delete process.env.ARCHON_HOME;
       const result = git.getWorktreeBase('/local/repo', 'invalid-no-slash');
       expect(result).toEqual({
-        base: join(homedir(), '.archon', 'workspaces', 'local', 'repo', 'worktrees'),
+        base: join(homedir(), '.archon', 'workspaces', '_local', 'repo', 'worktrees'),
         layout: 'workspace-scoped',
       });
+    });
+
+    test('ignores SSH-URL-shaped codebaseName (contains ":" / "@") and falls back to _local', () => {
+      // Regression guard (PR #1583): a name like "git@host.example:org/repo"
+      // used to be split naively at the last slash — the colon smuggled into
+      // the owner path segment broke docker-compose short-form volume specs
+      // (`HOST:CONTAINER:OPT`) inside devcontainers.
+      delete process.env.WORKSPACE_PATH;
+      delete process.env.ARCHON_DOCKER;
+      delete process.env.ARCHON_HOME;
+      mockLogger.warn.mockClear();
+      const result = git.getWorktreeBase(
+        '/srv/projects/widget-app',
+        'git@git.example.net:acme/widget-app'
+      );
+      expect(result).toEqual({
+        base: join(homedir(), '.archon', 'workspaces', '_local', 'widget-app', 'worktrees'),
+        layout: 'workspace-scoped',
+      });
+      // Rejection must stay observable — operators spot misconfigured
+      // codebases through this warn.
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        { codebaseName: 'git@git.example.net:acme/widget-app' },
+        'worktree.invalid_codebase_name_format'
+      );
+      // Check only the path below homedir — on Windows the home directory
+      // itself contains ":" in the drive letter (e.g. C:\Users\...).
+      const relativeToHome = result.base.slice(homedir().length);
+      expect(relativeToHome).not.toContain(':');
+      expect(relativeToHome).not.toContain('@');
+    });
+
+    test('resolves single-segment checkout paths via _local fallback (no throw)', () => {
+      // The historical last-two-segments heuristic threw for paths like
+      // /workspace (#2022); the shared fallback handles them.
+      delete process.env.WORKSPACE_PATH;
+      delete process.env.ARCHON_DOCKER;
+      delete process.env.ARCHON_HOME;
+      const result = git.getWorktreeBase('/workspace');
+      expect(result).toEqual({
+        base: join(homedir(), '.archon', 'workspaces', '_local', 'workspace', 'worktrees'),
+        layout: 'workspace-scoped',
+      });
+    });
+
+    test('throws for a degenerate repo path with no usable basename', () => {
+      delete process.env.WORKSPACE_PATH;
+      delete process.env.ARCHON_DOCKER;
+      delete process.env.ARCHON_HOME;
+      expect(() => git.getWorktreeBase('/')).toThrow('Cannot derive a project identity');
     });
 
     test('repoLocal override wins over workspace-scoped default', () => {
@@ -379,37 +438,6 @@ describe('git utilities', () => {
       delete process.env.ARCHON_DOCKER;
       delete process.env.ARCHON_HOME;
       expect(git.isProjectScopedWorktreeBase('/local/repo', 'invalid')).toBe(true);
-    });
-  });
-
-  describe('extractOwnerRepo', () => {
-    test('extracts owner and repo from a multi-segment path', () => {
-      const result = git.extractOwnerRepo(git.toRepoPath('/home/user/owner/repo'));
-      expect(result).toEqual({ owner: 'owner', repo: 'repo' });
-    });
-
-    test('extracts owner and repo from exactly 2-segment path', () => {
-      const result = git.extractOwnerRepo(git.toRepoPath('/owner/repo'));
-      expect(result).toEqual({ owner: 'owner', repo: 'repo' });
-    });
-
-    test('extracts owner and repo from Windows-style path', () => {
-      const result = git.extractOwnerRepo(
-        'C:\\Users\\dev\\owner\\repo' as ReturnType<typeof git.toRepoPath>
-      );
-      expect(result).toEqual({ owner: 'owner', repo: 'repo' });
-    });
-
-    test('throws when repoPath has fewer than 2 segments', () => {
-      expect(() => git.extractOwnerRepo(git.toRepoPath('/repo'))).toThrow(
-        'Cannot extract owner/repo from path "/repo"'
-      );
-    });
-
-    test('throws when repoPath is empty', () => {
-      expect(() => git.extractOwnerRepo('' as ReturnType<typeof git.toRepoPath>)).toThrow(
-        'Cannot extract owner/repo from path ""'
-      );
     });
   });
 
@@ -792,6 +820,38 @@ branch refs/heads/feature/auth
       expect(result).toBe('master');
     });
 
+    test('uses custom remote for symbolic-ref lookup and prefix stripping', async () => {
+      execSpy.mockResolvedValue({ stdout: 'upstream/main\n', stderr: '' });
+
+      const result = await git.getDefaultBranch('/workspace/repo', 'upstream');
+
+      expect(result).toBe('main');
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        ['-C', '/workspace/repo', 'symbolic-ref', 'refs/remotes/upstream/HEAD', '--short'],
+        expect.any(Object)
+      );
+    });
+
+    test('falls back to <remote>/main and names the remote in the failure error', async () => {
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('symbolic-ref')) {
+          throw new Error('fatal: ref refs/remotes/mar/HEAD is not a symbolic ref');
+        }
+        throw new Error('fatal: Needed a single revision');
+      });
+
+      await expect(git.getDefaultBranch('/workspace/repo', 'mar')).rejects.toThrow(
+        'neither mar/HEAD nor mar/main exist'
+      );
+      // Verify the fallback probed mar/main, not origin/main
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        ['-C', '/workspace/repo', 'rev-parse', '--verify', 'mar/main'],
+        expect.any(Object)
+      );
+    });
+
     test('returns non-standard branch from symbolic-ref (origin/develop)', async () => {
       execSpy.mockResolvedValue({ stdout: 'origin/develop\n', stderr: '' });
 
@@ -896,6 +956,125 @@ branch refs/heads/feature/auth
       );
       // Verify the error includes actionable config hint
       await expect(git.getDefaultBranch('/workspace/repo')).rejects.toThrow('config.yaml');
+    });
+  });
+
+  describe('getUniqueCommitCount', () => {
+    let execSpy: Mock<typeof git.execFileAsync>;
+
+    beforeEach(() => {
+      execSpy = spyOn(git, 'execFileAsync');
+    });
+
+    afterEach(() => {
+      execSpy.mockRestore();
+    });
+
+    test('returns zero when all tip commits are reachable from surviving refs', async () => {
+      execSpy
+        .mockResolvedValueOnce({
+          stdout:
+            'refs/heads/feature/auth\nrefs/heads/dev\nrefs/remotes/origin/feature/auth\nrefs/remotes/origin/dev\nrefs/tags/v1.0.0\n',
+          stderr: '',
+        })
+        .mockResolvedValueOnce({ stdout: '', stderr: '' });
+
+      const result = await git.getUniqueCommitCount('/workspace/repo', 'feature/auth');
+
+      expect(result).toBe(0);
+      expect(execSpy).toHaveBeenNthCalledWith(
+        1,
+        'git',
+        [
+          '-C',
+          '/workspace/repo',
+          'for-each-ref',
+          '--format=%(refname)',
+          'refs/heads',
+          'refs/remotes',
+          'refs/tags',
+        ],
+        expect.any(Object)
+      );
+      expect(execSpy).toHaveBeenNthCalledWith(
+        2,
+        'git',
+        [
+          '-C',
+          '/workspace/repo',
+          'rev-list',
+          'feature/auth',
+          '--not',
+          'refs/heads/dev',
+          'refs/remotes/origin/dev',
+          'refs/tags/v1.0.0',
+        ],
+        expect.any(Object)
+      );
+    });
+
+    test('counts commits reachable only from the candidate branch', async () => {
+      execSpy
+        .mockResolvedValueOnce({ stdout: 'refs/heads/feature/auth\nrefs/heads/dev\n', stderr: '' })
+        .mockResolvedValueOnce({ stdout: 'abc123\ndef456\n\n', stderr: '' });
+
+      const result = await git.getUniqueCommitCount('/workspace/repo', 'feature/auth');
+
+      expect(result).toBe(2);
+    });
+
+    test('excludes the configured remote counterpart but retains other remotes and tags', async () => {
+      execSpy
+        .mockResolvedValueOnce({
+          stdout:
+            'refs/heads/feature/auth\nrefs/remotes/upstream/feature/auth\nrefs/remotes/origin/feature/auth\nrefs/tags/reviewed\n',
+          stderr: '',
+        })
+        .mockResolvedValueOnce({ stdout: 'abc123\n', stderr: '' });
+
+      await git.getUniqueCommitCount('/workspace/repo', 'feature/auth', 'upstream');
+
+      expect(execSpy).toHaveBeenNthCalledWith(
+        2,
+        'git',
+        [
+          '-C',
+          '/workspace/repo',
+          'rev-list',
+          'feature/auth',
+          '--not',
+          'refs/remotes/origin/feature/auth',
+          'refs/tags/reviewed',
+        ],
+        expect.any(Object)
+      );
+    });
+
+    test('checks the full candidate history when no refs survive deletion', async () => {
+      execSpy
+        .mockResolvedValueOnce({
+          stdout: 'refs/heads/feature/auth\nrefs/remotes/origin/feature/auth\n',
+          stderr: '',
+        })
+        .mockResolvedValueOnce({ stdout: 'abc123\ndef456\n', stderr: '' });
+
+      const result = await git.getUniqueCommitCount('/workspace/repo', 'feature/auth');
+
+      expect(result).toBe(2);
+      expect(execSpy).toHaveBeenNthCalledWith(
+        2,
+        'git',
+        ['-C', '/workspace/repo', 'rev-list', 'feature/auth', '--not'],
+        expect.any(Object)
+      );
+    });
+
+    test('rejects when Git cannot enumerate refs', async () => {
+      execSpy.mockRejectedValueOnce(new Error('fatal: not a git repository'));
+
+      await expect(git.getUniqueCommitCount('/workspace/repo', 'feature/auth')).rejects.toThrow(
+        'Failed to count unique commits for feature/auth: fatal: not a git repository'
+      );
     });
   });
 
@@ -1216,6 +1395,108 @@ branch refs/heads/feature/auth
     });
   });
 
+  describe('getCurrentBranch', () => {
+    let execSpy: Mock<typeof git.execFileAsync>;
+
+    beforeEach(() => {
+      execSpy = spyOn(git, 'execFileAsync');
+    });
+
+    afterEach(() => {
+      execSpy.mockRestore();
+    });
+
+    test('returns branch name when on a named branch', async () => {
+      execSpy.mockResolvedValue({ stdout: 'main\n', stderr: '' });
+
+      const result = await git.getCurrentBranch('/workspace/repo' as git.RepoPath);
+
+      expect(result).toBe('main');
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        ['-C', '/workspace/repo', 'symbolic-ref', '--short', 'HEAD'],
+        { timeout: 10000 }
+      );
+    });
+
+    test('returns null for empty stdout (detached HEAD)', async () => {
+      execSpy.mockResolvedValue({ stdout: '', stderr: '' });
+
+      expect(await git.getCurrentBranch('/workspace/repo' as git.RepoPath)).toBeNull();
+    });
+
+    test('returns null for whitespace-only stdout', async () => {
+      execSpy.mockResolvedValue({ stdout: '   \n', stderr: '' });
+
+      expect(await git.getCurrentBranch('/workspace/repo' as git.RepoPath)).toBeNull();
+    });
+
+    test('returns null on any git error (detached HEAD, ENOENT, not a git repo)', async () => {
+      execSpy.mockRejectedValue(new Error('fatal: not a git repository'));
+
+      expect(await git.getCurrentBranch('/workspace/repo' as git.RepoPath)).toBeNull();
+    });
+
+    test('returns null on ENOENT (path not found)', async () => {
+      const error = Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+      execSpy.mockRejectedValue(error);
+
+      expect(await git.getCurrentBranch('/nonexistent' as git.RepoPath)).toBeNull();
+    });
+  });
+
+  describe('countCommitsAhead', () => {
+    let execSpy: Mock<typeof git.execFileAsync>;
+
+    beforeEach(() => {
+      execSpy = spyOn(git, 'execFileAsync');
+    });
+
+    afterEach(() => {
+      execSpy.mockRestore();
+    });
+
+    test('returns commit count when ahead of origin', async () => {
+      execSpy.mockResolvedValue({ stdout: '3\n', stderr: '' });
+
+      const result = await git.countCommitsAhead(
+        '/workspace/repo' as git.RepoPath,
+        'main' as git.BranchName
+      );
+
+      expect(result).toBe(3);
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        ['-C', '/workspace/repo', 'rev-list', '--count', 'origin/main..HEAD'],
+        { timeout: 10000 }
+      );
+    });
+
+    test('returns 0 when in sync', async () => {
+      execSpy.mockResolvedValue({ stdout: '0\n', stderr: '' });
+
+      expect(
+        await git.countCommitsAhead('/workspace/repo' as git.RepoPath, 'main' as git.BranchName)
+      ).toBe(0);
+    });
+
+    test('returns 0 for NaN stdout (malformed git output)', async () => {
+      execSpy.mockResolvedValue({ stdout: 'not-a-number\n', stderr: '' });
+
+      expect(
+        await git.countCommitsAhead('/workspace/repo' as git.RepoPath, 'main' as git.BranchName)
+      ).toBe(0);
+    });
+
+    test('returns 0 on any error (origin branch missing, ENOENT, etc.)', async () => {
+      execSpy.mockRejectedValue(new Error("fatal: unknown revision 'origin/main..HEAD'"));
+
+      expect(
+        await git.countCommitsAhead('/workspace/repo' as git.RepoPath, 'main' as git.BranchName)
+      ).toBe(0);
+    });
+  });
+
   describe('isAncestorOf', () => {
     let execSpy: Mock<typeof git.execFileAsync>;
 
@@ -1335,15 +1616,29 @@ branch refs/heads/feature/auth
     });
 
     test('fetches origin branch and returns synced result', async () => {
-      execSpy.mockResolvedValue({ stdout: '', stderr: '' });
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('status')) return { stdout: '', stderr: '' };
+        if (args.includes('rev-parse') && args.includes('--short=8')) {
+          return { stdout: 'abc12345\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('HEAD')) {
+          return { stdout: 'abc12345abcdef\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('origin/main')) {
+          return { stdout: 'abc12345abcdef\n', stderr: '' };
+        }
+        return { stdout: '', stderr: '' };
+      });
 
       const result = await git.syncWorkspace('/workspace/repo', 'main');
 
       expect(result).toEqual({
         branch: 'main',
         synced: true,
-        previousHead: '',
-        newHead: '',
+        mode: 'fast-forward',
+        state: 'in_sync',
+        previousHead: 'abc12345',
+        newHead: 'abc12345',
         updated: false,
       });
 
@@ -1354,10 +1649,23 @@ branch refs/heads/feature/auth
       );
     });
 
-    test('hard-resets working tree to origin after fetch', async () => {
+    test('does not reset by default', async () => {
       execSpy.mockResolvedValue({ stdout: '', stderr: '' });
 
       await git.syncWorkspace('/workspace/repo', 'main');
+
+      const resetCalls = execSpy.mock.calls.filter((call: unknown[]) => {
+        const args = call[1] as string[];
+        return args.includes('reset');
+      });
+
+      expect(resetCalls).toHaveLength(0);
+    });
+
+    test('hard-resets working tree to origin in reset mode', async () => {
+      execSpy.mockResolvedValue({ stdout: '', stderr: '' });
+
+      await git.syncWorkspace('/workspace/repo', 'main', { mode: 'reset' });
 
       const resetCalls = execSpy.mock.calls.filter((call: unknown[]) => {
         const args = call[1] as string[];
@@ -1368,7 +1676,7 @@ branch refs/heads/feature/auth
       expect(resetCalls[0][1]).toEqual(['-C', '/workspace/repo', 'reset', '--hard', 'origin/main']);
     });
 
-    test('throws if reset fails after successful fetch', async () => {
+    test('throws if reset mode fails after successful fetch', async () => {
       execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
         if (args.includes('reset')) {
           throw new Error('fatal: Could not reset index file');
@@ -1376,7 +1684,7 @@ branch refs/heads/feature/auth
         return { stdout: '', stderr: '' };
       });
 
-      await expect(git.syncWorkspace('/workspace/repo', 'main')).rejects.toThrow(
+      await expect(git.syncWorkspace('/workspace/repo', 'main', { mode: 'reset' })).rejects.toThrow(
         'Reset to origin/main failed'
       );
     });
@@ -1391,6 +1699,31 @@ branch refs/heads/feature/auth
 
       await expect(git.syncWorkspace('/workspace/repo', 'main')).rejects.toThrow(
         'unable to access repository'
+      );
+    });
+
+    test('logs short SHA read failures without failing sync', async () => {
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('rev-parse') && args.includes('--short=8')) {
+          throw new Error('fatal: bad revision HEAD');
+        }
+        if (args.includes('status')) return { stdout: '', stderr: '' };
+        if (args.includes('rev-parse') && args.includes('HEAD')) {
+          return { stdout: 'abc12345abcdef\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('origin/main')) {
+          return { stdout: 'abc12345abcdef\n', stderr: '' };
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      const result = await git.syncWorkspace('/workspace/repo', 'main');
+
+      expect(result.previousHead).toBe('');
+      expect(result.newHead).toBe('');
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ workspacePath: '/workspace/repo', ref: 'HEAD' }),
+        'workspace.short_sha_read_failed'
       );
     });
 
@@ -1420,7 +1753,19 @@ branch refs/heads/feature/auth
     });
 
     test('derives branch from getDefaultBranch when override not provided', async () => {
-      execSpy.mockResolvedValue({ stdout: '', stderr: '' });
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('status')) return { stdout: '', stderr: '' };
+        if (args.includes('rev-parse') && args.includes('--short=8')) {
+          return { stdout: 'abc12345\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('HEAD')) {
+          return { stdout: 'abc12345abcdef\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('origin/develop')) {
+          return { stdout: 'abc12345abcdef\n', stderr: '' };
+        }
+        return { stdout: '', stderr: '' };
+      });
       getDefaultBranchSpy.mockResolvedValue('develop');
 
       const result = await git.syncWorkspace('/workspace/repo');
@@ -1428,11 +1773,13 @@ branch refs/heads/feature/auth
       expect(result).toEqual({
         branch: 'develop',
         synced: true,
-        previousHead: '',
-        newHead: '',
+        mode: 'fast-forward',
+        state: 'in_sync',
+        previousHead: 'abc12345',
+        newHead: 'abc12345',
         updated: false,
       });
-      expect(getDefaultBranchSpy).toHaveBeenCalledWith('/workspace/repo');
+      expect(getDefaultBranchSpy).toHaveBeenCalledWith('/workspace/repo', 'origin');
     });
 
     test('throws actionable error when configured branch not found on remote', async () => {
@@ -1466,20 +1813,31 @@ branch refs/heads/feature/auth
       await expect(git.syncWorkspace('/workspace/repo')).rejects.not.toThrow('worktree.baseBranch');
     });
 
-    test('skips reset when resetAfterFetch is false (fetch-only mode)', async () => {
-      execSpy.mockResolvedValue({ stdout: '', stderr: '' });
+    test('fetch-only mode fetches and does not reset or merge', async () => {
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('status')) return { stdout: '', stderr: '' };
+        if (args.includes('rev-parse') && args.includes('--short=8')) {
+          return { stdout: 'abc12345\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('HEAD')) {
+          return { stdout: 'abc12345abcdef\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('origin/main')) {
+          return { stdout: 'def67890abcdef\n', stderr: '' };
+        }
+        if (args.includes('merge-base')) {
+          throw Object.assign(new Error('not ancestor'), { code: 1 });
+        }
+        return { stdout: '', stderr: '' };
+      });
 
       const result = await git.syncWorkspace('/workspace/repo', 'main', {
-        resetAfterFetch: false,
+        mode: 'fetch-only',
       });
 
-      expect(result).toEqual({
-        branch: 'main',
-        synced: true,
-        previousHead: '',
-        newHead: '',
-        updated: false,
-      });
+      expect(result.mode).toBe('fetch-only');
+      expect(result.state).toBe('diverged');
+      expect(result.updated).toBe(false);
 
       // Fetch should still have been called
       const fetchCalls = execSpy.mock.calls.filter((call: unknown[]) => {
@@ -1494,6 +1852,326 @@ branch refs/heads/feature/auth
         return args.includes('reset');
       });
       expect(resetCalls).toHaveLength(0);
+      const mergeCalls = execSpy.mock.calls.filter((call: unknown[]) => {
+        const args = call[1] as string[];
+        return args.includes('merge');
+      });
+      expect(mergeCalls).toHaveLength(0);
+    });
+
+    test('dirty tracked files return dirty and do not merge or reset', async () => {
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('status')) return { stdout: ' M src/index.ts\n', stderr: '' };
+        if (args.includes('rev-parse') && args.includes('--short=8')) {
+          return { stdout: 'abc12345\n', stderr: '' };
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      const result = await git.syncWorkspace('/workspace/repo', 'main');
+
+      expect(result.state).toBe('dirty');
+      expect(
+        execSpy.mock.calls.some((call: unknown[]) => (call[1] as string[]).includes('merge'))
+      ).toBe(false);
+      expect(
+        execSpy.mock.calls.some((call: unknown[]) => (call[1] as string[]).includes('reset'))
+      ).toBe(false);
+    });
+
+    test('untracked files do not mark the checkout dirty', async () => {
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('status')) {
+          expect(args).toContain('--untracked-files=no');
+          return { stdout: '', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('--short=8')) {
+          return { stdout: 'abc12345\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('HEAD')) {
+          return { stdout: 'abc12345abcdef\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('origin/main')) {
+          return { stdout: 'abc12345abcdef\n', stderr: '' };
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      const result = await git.syncWorkspace('/workspace/repo', 'main');
+
+      expect(result.state).toBe('in_sync');
+    });
+
+    test('behind on current target branch fast-forwards', async () => {
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('status')) return { stdout: '', stderr: '' };
+        if (args.includes('rev-parse') && args.includes('--short=8')) {
+          const shortCalls = execSpy.mock.calls.filter((call: unknown[]) =>
+            (call[1] as string[]).includes('--short=8')
+          );
+          return { stdout: shortCalls.length > 1 ? 'def67890\n' : 'abc12345\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('--abbrev-ref')) {
+          return { stdout: 'main\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('HEAD')) {
+          return { stdout: 'abc12345abcdef\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('origin/main')) {
+          return { stdout: 'def67890abcdef\n', stderr: '' };
+        }
+        if (args.includes('merge-base')) {
+          if (args[4] === 'abc12345abcdef' && args[5] === 'def67890abcdef') {
+            return { stdout: '', stderr: '' };
+          }
+          throw Object.assign(new Error('not ancestor'), { code: 1 });
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      const result = await git.syncWorkspace('/workspace/repo', 'main');
+
+      expect(result.state).toBe('in_sync');
+      expect(result.updated).toBe(true);
+      expect(
+        execSpy.mock.calls.some((call: unknown[]) => (call[1] as string[]).includes('merge'))
+      ).toBe(true);
+    });
+
+    test('behind on non-target current branch does not fast-forward', async () => {
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('status')) return { stdout: '', stderr: '' };
+        if (args.includes('rev-parse') && args.includes('--short=8')) {
+          return { stdout: 'abc12345\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('--abbrev-ref')) {
+          return { stdout: 'feature\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('HEAD')) {
+          return { stdout: 'abc12345abcdef\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('origin/main')) {
+          return { stdout: 'def67890abcdef\n', stderr: '' };
+        }
+        if (args.includes('merge-base')) {
+          if (args[4] === 'abc12345abcdef' && args[5] === 'def67890abcdef') {
+            return { stdout: '', stderr: '' };
+          }
+          throw Object.assign(new Error('not ancestor'), { code: 1 });
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      const result = await git.syncWorkspace('/workspace/repo', 'main');
+
+      expect(result.state).toBe('behind');
+      expect(result.updated).toBe(false);
+      expect(
+        execSpy.mock.calls.some((call: unknown[]) => (call[1] as string[]).includes('merge'))
+      ).toBe(false);
+    });
+
+    test('ahead and diverged preserve local state', async () => {
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('status')) return { stdout: '', stderr: '' };
+        if (args.includes('rev-parse') && args.includes('--short=8')) {
+          return { stdout: 'def67890\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('HEAD')) {
+          return { stdout: 'def67890abcdef\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('origin/main')) {
+          return { stdout: 'abc12345abcdef\n', stderr: '' };
+        }
+        if (args.includes('merge-base')) {
+          if (args[4] === 'abc12345abcdef' && args[5] === 'def67890abcdef') {
+            return { stdout: '', stderr: '' };
+          }
+          throw Object.assign(new Error('not ancestor'), { code: 1 });
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      const aheadResult = await git.syncWorkspace('/workspace/repo', 'main');
+      expect(aheadResult.state).toBe('ahead');
+      expect(
+        execSpy.mock.calls.some((call: unknown[]) => (call[1] as string[]).includes('merge'))
+      ).toBe(false);
+
+      execSpy.mockClear();
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('status')) return { stdout: '', stderr: '' };
+        if (args.includes('rev-parse')) return { stdout: `${args.at(-1)}-sha\n`, stderr: '' };
+        if (args.includes('merge-base'))
+          throw Object.assign(new Error('not ancestor'), { code: 1 });
+        return { stdout: '', stderr: '' };
+      });
+
+      const divergedResult = await git.syncWorkspace('/workspace/repo', 'main');
+      expect(divergedResult.state).toBe('diverged');
+      expect(
+        execSpy.mock.calls.some((call: unknown[]) => (call[1] as string[]).includes('merge'))
+      ).toBe(false);
+    });
+
+    test('throws unexpected merge-base failures instead of treating them as diverged', async () => {
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('status')) return { stdout: '', stderr: '' };
+        if (args.includes('rev-parse') && args.includes('--short=8')) {
+          return { stdout: 'abc12345\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('HEAD')) {
+          return { stdout: 'local-sha\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('origin/main')) {
+          return { stdout: 'remote-sha\n', stderr: '' };
+        }
+        if (args.includes('merge-base')) {
+          throw Object.assign(new Error('fatal: bad object'), { code: 128, stderr: 'bad object' });
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      await expect(git.syncWorkspace('/workspace/repo', 'main')).rejects.toThrow(
+        'Failed to compare git ancestry'
+      );
+      expect(mockLogger.error).toHaveBeenCalledWith(
+        expect.objectContaining({ workspacePath: '/workspace/repo' }),
+        'workspace.merge_base_check_failed'
+      );
+    });
+
+    test('fetches and resets from custom remote when provided in options', async () => {
+      execSpy.mockResolvedValue({ stdout: '', stderr: '' });
+
+      await git.syncWorkspace('/workspace/repo', 'main', { mode: 'reset', remote: 'mar' });
+
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        ['-C', '/workspace/repo', 'fetch', 'mar', 'main'],
+        expect.any(Object)
+      );
+
+      const resetCalls = execSpy.mock.calls.filter((call: unknown[]) => {
+        const args = call[1] as string[];
+        return args.includes('reset');
+      });
+      expect(resetCalls).toHaveLength(1);
+      expect(resetCalls[0][1]).toEqual(['-C', '/workspace/repo', 'reset', '--hard', 'mar/main']);
+    });
+
+    test('classifies state against the custom remote ref in fast-forward mode', async () => {
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('status')) return { stdout: '', stderr: '' };
+        if (args.includes('rev-parse') && args.includes('--short=8')) {
+          return { stdout: 'abc12345\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('HEAD')) {
+          return { stdout: 'abc12345abcdef\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('upstream/main')) {
+          return { stdout: 'abc12345abcdef\n', stderr: '' };
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      const result = await git.syncWorkspace('/workspace/repo', 'main', { remote: 'upstream' });
+
+      expect(result.state).toBe('in_sync');
+      // The state classification must rev-parse upstream/main, not origin/main
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        ['-C', '/workspace/repo', 'rev-parse', 'upstream/main'],
+        expect.any(Object)
+      );
+    });
+
+    test('passes custom remote to getDefaultBranch when baseBranch not provided', async () => {
+      execSpy.mockResolvedValue({ stdout: '', stderr: '' });
+      getDefaultBranchSpy.mockResolvedValue('develop');
+
+      await git.syncWorkspace('/workspace/repo', undefined, { remote: 'upstream' });
+
+      expect(getDefaultBranchSpy).toHaveBeenCalledWith('/workspace/repo', 'upstream');
+    });
+
+    test('includes custom remote name in fetch error message', async () => {
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('fetch')) {
+          throw new Error("fatal: 'mar' does not appear to be a git repository");
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      await expect(git.syncWorkspace('/workspace/repo', 'main', { remote: 'mar' })).rejects.toThrow(
+        'Sync fetch from mar/main failed'
+      );
+    });
+
+    test('names the custom remote in the configured-branch-missing error', async () => {
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('fetch')) {
+          throw new Error("fatal: couldn't find remote ref does-not-exist");
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      await expect(
+        git.syncWorkspace('/workspace/repo', 'does-not-exist', { remote: 'mar' })
+      ).rejects.toThrow("Configured base branch 'does-not-exist' not found on remote 'mar'");
+    });
+  });
+
+  describe('getDefaultRemote', () => {
+    let execSpy: Mock<typeof git.execFileAsync>;
+
+    beforeEach(() => {
+      execSpy = spyOn(git, 'execFileAsync');
+    });
+
+    afterEach(() => {
+      execSpy.mockRestore();
+    });
+
+    test('returns origin when it exists among multiple remotes', async () => {
+      execSpy.mockResolvedValue({ stdout: 'upstream\norigin\n', stderr: '' });
+
+      const result = await git.getDefaultRemote('/workspace/repo');
+      expect(result).toBe('origin');
+    });
+
+    test('returns sole remote when only one is configured', async () => {
+      execSpy.mockResolvedValue({ stdout: 'mar\n', stderr: '' });
+
+      const result = await git.getDefaultRemote('/workspace/repo');
+      expect(result).toBe('mar');
+    });
+
+    test('returns null when multiple non-origin remotes exist', async () => {
+      execSpy.mockResolvedValue({ stdout: 'jan\nfeb\nmar\n', stderr: '' });
+
+      const result = await git.getDefaultRemote('/workspace/repo');
+      expect(result).toBeNull();
+    });
+
+    test('returns null when no remotes are configured', async () => {
+      execSpy.mockResolvedValue({ stdout: '', stderr: '' });
+
+      const result = await git.getDefaultRemote('/workspace/repo');
+      expect(result).toBeNull();
+    });
+
+    test('propagates git errors instead of swallowing them', async () => {
+      execSpy.mockRejectedValue(new Error('not a git repository'));
+
+      await expect(git.getDefaultRemote('/workspace/repo')).rejects.toThrow('not a git repository');
+    });
+
+    test('handles CRLF line endings from git output', async () => {
+      execSpy.mockResolvedValue({ stdout: 'origin\r\nupstream\r\n', stderr: '' });
+
+      const result = await git.getDefaultRemote('/workspace/repo');
+      expect(result).toBe('origin');
     });
   });
 
@@ -1517,8 +2195,26 @@ branch refs/heads/feature/auth
       expect(execSpy).toHaveBeenCalledWith(
         'git',
         ['clone', 'https://github.com/owner/repo.git', '/tmp/target'],
-        { timeout: 120000 }
+        {
+          timeout: 120000,
+          env: expect.objectContaining({ GIT_TERMINAL_PROMPT: '0' }) as NodeJS.ProcessEnv,
+        }
       );
+    });
+
+    test('passes GIT_TERMINAL_PROMPT=0 to the git clone subprocess', async () => {
+      execSpy.mockResolvedValue({ stdout: '', stderr: '' });
+
+      await git.cloneRepository('https://github.com/owner/repo.git', '/tmp/target');
+
+      const env = execSpy.mock.calls[0]![2]?.env ?? {};
+      expect(env.GIT_TERMINAL_PROMPT).toBe('0');
+      // The rest of the environment must be inherited, not stripped. On
+      // Windows the key can be 'Path' — spreading process.env keeps the
+      // original casing — so locate the path key case-insensitively.
+      const pathKey = Object.keys(env).find(k => k.toLowerCase() === 'path');
+      expect(pathKey).toBeDefined();
+      expect(env[pathKey!]).toBe(process.env[pathKey!]);
     });
 
     test('constructs authenticated URL with token', async () => {
@@ -1608,6 +2304,22 @@ branch refs/heads/feature/auth
         timeout: 60000,
       });
       expect(execSpy).toHaveBeenCalledWith('git', ['reset', '--hard', 'origin/main'], {
+        cwd: '/workspace/repo',
+        timeout: 30000,
+      });
+    });
+
+    test('fetches and resets using a custom remote', async () => {
+      execSpy.mockResolvedValue({ stdout: '', stderr: '' });
+
+      const result = await git.syncRepository('/workspace/repo', 'main', 'upstream');
+
+      expect(result).toEqual({ ok: true, value: undefined });
+      expect(execSpy).toHaveBeenCalledWith('git', ['fetch', 'upstream'], {
+        cwd: '/workspace/repo',
+        timeout: 60000,
+      });
+      expect(execSpy).toHaveBeenCalledWith('git', ['reset', '--hard', 'upstream/main'], {
         cwd: '/workspace/repo',
         timeout: 30000,
       });
@@ -1777,6 +2489,52 @@ branch refs/heads/feature/auth
     });
   });
 
+  describe('listChildRepos', () => {
+    const root = join(tmpdir(), 'archon-childrepos-test-' + Date.now());
+
+    beforeEach(async () => {
+      await realMkdir(root, { recursive: true });
+    });
+
+    afterEach(async () => {
+      await rm(root, { recursive: true, force: true });
+    });
+
+    test('lists immediate child directories that contain .git, sorted', async () => {
+      // Two git repos (svc-b, svc-a), one plain dir, one .git as a file (worktree)
+      await realMkdir(join(root, 'svc-a', '.git'), { recursive: true });
+      await realMkdir(join(root, 'svc-b', '.git'), { recursive: true });
+      await realMkdir(join(root, 'docs'), { recursive: true });
+      await realMkdir(join(root, 'svc-c'), { recursive: true });
+      await writeFile(join(root, 'svc-c', '.git'), 'gitdir: /elsewhere\n');
+
+      const result = await git.listChildRepos(root);
+      expect(result).toEqual(['svc-a', 'svc-b', 'svc-c']);
+    });
+
+    test('returns empty array when no child repos exist', async () => {
+      await realMkdir(join(root, 'plain-a'), { recursive: true });
+      await realMkdir(join(root, 'plain-b'), { recursive: true });
+
+      const result = await git.listChildRepos(root);
+      expect(result).toEqual([]);
+    });
+
+    test('does not recurse into nested repos', async () => {
+      await realMkdir(join(root, 'svc-a', '.git'), { recursive: true });
+      // Nested repo one level deeper — must NOT be reported
+      await realMkdir(join(root, 'svc-a', 'inner', '.git'), { recursive: true });
+
+      const result = await git.listChildRepos(root);
+      expect(result).toEqual(['svc-a']);
+    });
+
+    test('returns empty array for an unreadable/nonexistent root (never throws)', async () => {
+      const result = await git.listChildRepos(join(root, 'does-not-exist'));
+      expect(result).toEqual([]);
+    });
+  });
+
   describe('getRemoteUrl', () => {
     let execSpy: Mock<typeof git.execFileAsync>;
 
@@ -1796,6 +2554,21 @@ branch refs/heads/feature/auth
 
       const result = await git.getRemoteUrl('/workspace/repo');
       expect(result).toBe('https://github.com/owner/repo.git');
+    });
+
+    test('queries a custom remote when provided', async () => {
+      execSpy.mockResolvedValue({
+        stdout: 'https://github.com/owner/repo.git\n',
+        stderr: '',
+      });
+
+      await git.getRemoteUrl('/workspace/repo', 'upstream');
+
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        ['-C', '/workspace/repo', 'remote', 'get-url', 'upstream'],
+        expect.any(Object)
+      );
     });
 
     test('returns null when no remote configured', async () => {

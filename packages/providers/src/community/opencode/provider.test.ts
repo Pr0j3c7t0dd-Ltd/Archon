@@ -304,12 +304,7 @@ describe('OpencodeProvider', () => {
         tokens: { input: 11, output: 7, total: 21, cost: 0.42 },
         cost: 0.42,
         stopReason: 'stop',
-        modelUsage: {
-          providerID: 'anthropic',
-          modelID: 'claude-sonnet',
-          reasoning: 3,
-          cache: 1,
-        },
+        resolvedModel: { id: 'claude-sonnet' },
       },
     ]);
   });
@@ -344,8 +339,31 @@ describe('OpencodeProvider', () => {
         type: 'system',
         content: '⚠️ Could not resume OpenCode session. Starting fresh conversation.',
       },
-      { type: 'result', sessionId: 'fresh-session' },
+      // A requested resume that fell back to a fresh session is reported as cold.
+      { type: 'result', sessionId: 'fresh-session', resumed: false },
     ]);
+  });
+
+  test('reports resumed:true on the result when the prior session is found', async () => {
+    const runtime = makeRuntime({
+      sessionGet: mock(async () => ({ data: { id: 'resumed-session' } })),
+    });
+    runtimeQueue.push(runtime);
+    scriptedEvents = [
+      {
+        type: 'session.idle',
+        properties: { sessionID: 'resumed-session' },
+      },
+    ];
+
+    const { chunks, error } = await consume(
+      new OpencodeProvider().sendQuery('hi', '/tmp', 'resumed-session', {
+        assistantConfig: TEST_MODEL,
+      })
+    );
+
+    expect(error).toBeUndefined();
+    expect(chunks).toEqual([{ type: 'result', sessionId: 'resumed-session', resumed: true }]);
   });
 
   test('structured output success includes parsed payload on result chunk', async () => {
@@ -404,12 +422,6 @@ describe('OpencodeProvider', () => {
         type: 'result',
         sessionId: 'session-1',
         structuredOutput: { answer: 'ok', confidence: 0.9 },
-        modelUsage: {
-          providerID: undefined,
-          modelID: undefined,
-          reasoning: undefined,
-          cache: undefined,
-        },
       },
     ]);
   });
@@ -453,12 +465,6 @@ describe('OpencodeProvider', () => {
       {
         type: 'result',
         sessionId: 'session-1',
-        modelUsage: {
-          providerID: undefined,
-          modelID: undefined,
-          reasoning: undefined,
-          cache: undefined,
-        },
       },
     ]);
     expect(mockLogger.warn).toHaveBeenCalledTimes(1);

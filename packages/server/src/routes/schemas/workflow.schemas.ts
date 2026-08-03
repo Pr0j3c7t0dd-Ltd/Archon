@@ -40,6 +40,12 @@ export const workflowListEntrySchema = z
 export const workflowListResponseSchema = z
   .object({
     workflows: z.array(workflowListEntrySchema),
+    /**
+     * Repo-owner-curated workflow names from `.archon/config.yaml`
+     * `recommendedWorkflows`, filtered to names present in `workflows` and
+     * preserved in declared order. Empty when no project context or no key.
+     */
+    recommended: z.array(z.string()),
     errors: z.array(workflowLoadErrorSchema).optional(),
   })
   .openapi('WorkflowListResponse');
@@ -252,4 +258,8 @@ export const workflowRunsQuerySchema = z.object({
   status: z.string().optional(),
   codebaseId: z.string().optional(),
   limit: z.string().optional(),
+  // Non-enforcing "mine" filter: 'true' restricts to the caller's own runs
+  // when an identity resolves. Default lists everything. Enum makes the boolean
+  // contract explicit (the handler treats only 'true' as on).
+  mine: z.enum(['true', 'false']).optional(),
 });

@@ -49,7 +49,7 @@ import { createIsolationStore } from '../db/isolation-environments';
 import { toError } from '../utils/error';
 import { getCodebase } from '../db/codebases';
 import { executeWorkflow } from '@archon/workflows/executor';
-import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
+import type { WorkflowDefinition, WorkflowSource } from '@archon/workflows/schemas/workflow';
 import { createWorkflowDeps } from '../workflows/store-adapter';
 import {
   cleanupToMakeRoom,
@@ -57,6 +57,9 @@ import {
   STALE_THRESHOLD_DAYS,
 } from '../services/cleanup-service';
 import { loadRepoConfig } from '../config/config-loader';
+import { isPerUserGitHubEnabled } from '../github-auth/config';
+import { getUserGithubNoreplyEmail } from '../db/user-github-token-store';
+import { toBranchName } from '@archon/git';
 
 type IsolationResolution =
   | { status: 'existing'; cwd: string; env: IsolationEnvironmentRow }
@@ -114,14 +117,33 @@ export async function validateAndResolveIsolation(
   _isRetry = false,
   userId?: string
 ): Promise<IsolationResolution> {
+  // Resolve the originating user's git identity (no-reply email) so a freshly
+  // created worktree stamps commits with the human. Only when per-user GitHub is
+  // enabled and the user is connected; otherwise the worktree uses the ambient
+  // git identity (unchanged behavior).
+  let gitIdentity: { email: string; name?: string } | undefined;
+  if (userId && isPerUserGitHubEnabled()) {
+    const email = await getUserGithubNoreplyEmail(userId);
+    if (email) gitIdentity = { email };
+  }
+
   const result = await getResolver().resolve({
     existingEnvId: conversation.isolation_env_id,
     codebase: codebase
-      ? { id: codebase.id, defaultCwd: codebase.default_cwd, name: codebase.name }
+      ? {
+          id: codebase.id,
+          defaultCwd: codebase.default_cwd,
+          name: codebase.name,
+          defaultBranch: codebase.default_branch?.trim()
+            ? toBranchName(codebase.default_branch.trim())
+            : null,
+          kind: codebase.kind,
+        }
       : null,
     hints,
     platformType: platform.getPlatformType(),
     userId,
+    gitIdentity,
   });
 
   switch (result.status) {
@@ -255,6 +277,12 @@ export interface WorkflowRoutingContext {
    * worker isolation environment, and downstream workflow_run row.
    */
   readonly userId?: string;
+  /**
+   * Discovery source of the workflow — telemetry only (bundled workflows
+   * report their real name, custom ones report "custom"). Optional; defaults
+   * to the privacy-safe "custom" treatment when not provided.
+   */
+  readonly source?: WorkflowSource;
 }
 
 /**
@@ -290,9 +318,11 @@ export async function dispatchBackgroundWorkflow(
     hidden: true,
   });
 
-  // 3. Resolve isolation for this worker (each background workflow gets its own worktree).
-  // Isolation failure is fatal — never run a workflow in a shared/parent worktree.
+  // 3. Resolve isolation for this worker. Unless the workflow explicitly opts out of
+  // worktrees, each background workflow gets its own worktree — and isolation failure
+  // is then fatal (never fall back to running in a shared/parent worktree).
   let workerCwd: string;
+  let codebaseBaseBranch: string | undefined;
   if (ctx.codebaseId) {
     const codebase = await getCodebase(ctx.codebaseId);
     if (!codebase) {
@@ -300,22 +330,36 @@ export async function dispatchBackgroundWorkflow(
         `Cannot dispatch workflow "${workflow.name}": codebase ${ctx.codebaseId} not found`
       );
     }
-    const result = await validateAndResolveIsolation(
-      workerConv,
-      codebase,
-      ctx.platform,
-      workerPlatformId,
-      { workflowType: 'thread', workflowId: workerPlatformId },
-      false,
-      ctx.userId
-    );
-    workerCwd = result.cwd;
-    await db.updateConversation(workerConv.id, { cwd: workerCwd }).catch((e: unknown) => {
-      getLog().warn(
-        { err: toError(e), workerPlatformId },
-        'orchestrator.worker_cwd_persist_failed'
+    codebaseBaseBranch = codebase.default_branch?.trim() || undefined;
+    if (workflow.worktree?.enabled === false) {
+      // Respect an explicit worktree opt-out: skip isolation and run in the parent's cwd.
+      getLog().info(
+        {
+          workflowName: workflow.name,
+          conversationId: ctx.conversationId,
+          codebaseId: ctx.codebaseId,
+        },
+        'workflow.worktree_disabled_by_policy'
       );
-    });
+      workerCwd = ctx.cwd;
+    } else {
+      const result = await validateAndResolveIsolation(
+        workerConv,
+        codebase,
+        ctx.platform,
+        workerPlatformId,
+        { workflowType: 'thread', workflowId: workerPlatformId },
+        false,
+        ctx.userId
+      );
+      workerCwd = result.cwd;
+      await db.updateConversation(workerConv.id, { cwd: workerCwd }).catch((e: unknown) => {
+        getLog().warn(
+          { err: toError(e), workerPlatformId },
+          'orchestrator.worker_cwd_persist_failed'
+        );
+      });
+    }
   } else {
     // No codebase — run in parent's cwd (no isolation needed for non-repo workflows)
     workerCwd = ctx.cwd;
@@ -396,6 +440,8 @@ export async function dispatchBackgroundWorkflow(
             parentConversationId: ctx.conversationDbId,
             preCreatedRun,
             userId: ctx.userId,
+            source: ctx.source,
+            baseBranch: codebaseBaseBranch,
           }
         );
         // Surface workflow output to parent conversation as a result card

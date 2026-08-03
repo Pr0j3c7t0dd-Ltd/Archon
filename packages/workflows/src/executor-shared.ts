@@ -26,7 +26,11 @@ function getLog(): ReturnType<typeof createLogger> {
 /** Result of error classification */
 export type ErrorType = 'TRANSIENT' | 'FATAL' | 'UNKNOWN';
 
-/** Fatal error patterns - authentication/authorization issues that won't resolve with retry */
+/**
+ * Fatal error patterns - errors that won't resolve with retry: authentication/
+ * authorization failures and provider quota/limit-window exhaustion (a retry
+ * inside the same limit window is guaranteed to fail — see #2177).
+ */
 export const FATAL_PATTERNS = [
   'unauthorized',
   'forbidden',
@@ -37,6 +41,9 @@ export const FATAL_PATTERNS = [
   '403',
   'credit balance',
   'auth error',
+  'session limit', // Claude subscription 5h window — covers every detectCreditExhaustion session variant
+  'usage limit reached', // Claude CLI quota string, e.g. "Claude AI usage limit reached|<ts>"
+  'credit exhaustion', // synthesized "Credit exhaustion detected — resume when credits reset"
 ];
 
 /** Transient error patterns - temporary issues that may resolve with retry */
@@ -80,6 +87,27 @@ export function classifyError(error: Error): ErrorType {
     return 'TRANSIENT';
   }
   return 'UNKNOWN';
+}
+
+/**
+ * Map the retry-oriented {@link ErrorType} to the telemetry wire enum. The
+ * telemetry event carries ONLY this fixed-enum class — never error text.
+ */
+export function toTelemetryErrorClass(errorType: ErrorType): archonPaths.WorkflowErrorClass {
+  switch (errorType) {
+    case 'FATAL':
+      return 'fatal';
+    case 'TRANSIENT':
+      return 'transient';
+    case 'UNKNOWN':
+      return 'unknown';
+    default: {
+      // Exhaustiveness guard: a future ErrorType variant fails compilation
+      // here instead of silently sending `undefined` to the telemetry wire.
+      const exhaustive: never = errorType;
+      return exhaustive;
+    }
+  }
 }
 
 // ─── Subprocess Failure Formatting ───────────────────────────────────────────
@@ -160,9 +188,16 @@ export function formatSubprocessFailure(
   };
 }
 
-// ─── Credit Exhaustion Detection ────────────────────────────────────────────
+// ─── Credit/Limit Exhaustion Detection ──────────────────────────────────────
 
-/** Patterns that indicate credit/quota exhaustion in streamed assistant output */
+/** Patterns that indicate a subscription session limit in streamed assistant output */
+const SESSION_LIMIT_OUTPUT_PATTERNS = [
+  'hit your session limit',
+  'session limit reached',
+  'session limit has been reached',
+];
+
+/** Patterns that indicate pay-per-token credit exhaustion in streamed assistant output */
 const CREDIT_EXHAUSTION_OUTPUT_PATTERNS = [
   "you're out of extra usage",
   'out of credits',
@@ -170,18 +205,38 @@ const CREDIT_EXHAUSTION_OUTPUT_PATTERNS = [
   'insufficient credit',
 ];
 
+/** Extract a reset-time clause from a session-limit message, e.g. "resets 3am (America/Mexico_City)". */
+function extractResetTime(text: string): string | null {
+  const match = /resets\s+([^\n·.!]+)/i.exec(text);
+  return match ? match[1].trim() : null;
+}
+
 /**
- * Detect credit exhaustion in streamed node output text.
+ * Detect credit/session-limit exhaustion in streamed node output text.
  *
- * The Claude SDK returns credit exhaustion as a normal assistant text message
- * rather than throwing. This function checks the accumulated output for known
- * credit exhaustion phrases.
+ * The Claude SDK surfaces both subscription session limits and pay-per-token
+ * credit exhaustion as normal assistant text messages rather than thrown errors.
+ * This function checks the accumulated output for known phrases and returns an
+ * actionable error string, or null if no limit is detected.
+ *
+ * @returns null if no limit detected; a session-limit string (instructs user to
+ * abandon and retry after reset) or a credit-exhaustion string (instructs user
+ * to resume when credits refill).
  */
 export function detectCreditExhaustion(text: string): string | null {
   const lower = text.toLowerCase();
+
+  if (SESSION_LIMIT_OUTPUT_PATTERNS.some(p => lower.includes(p))) {
+    const resetTime = extractResetTime(text);
+    return resetTime
+      ? `Claude session limit reached — resets ${resetTime}. Abandon this run and retry after reset.`
+      : 'Claude session limit reached — abandon this run and retry when the session resets.';
+  }
+
   if (CREDIT_EXHAUSTION_OUTPUT_PATTERNS.some(p => lower.includes(p))) {
     return 'Credit exhaustion detected — resume when credits reset';
   }
+
   return null;
 }
 

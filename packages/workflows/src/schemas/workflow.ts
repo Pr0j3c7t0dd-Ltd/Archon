@@ -21,6 +21,15 @@ export type ModelReasoningEffort = z.infer<typeof modelReasoningEffortSchema>;
 
 export const webSearchModeSchema = z.enum(['disabled', 'cached', 'live']);
 
+/**
+ * External capabilities a workflow declares it needs. Today only `github`
+ * (the originating user must have connected their GitHub identity); the array
+ * shape leaves room for `gitea`/`gitlab` etc. without a schema change.
+ */
+export const workflowRequirementSchema = z.enum(['github']);
+
+export type WorkflowRequirement = z.infer<typeof workflowRequirementSchema>;
+
 export type WebSearchMode = z.infer<typeof webSearchModeSchema>;
 
 // ---------------------------------------------------------------------------
@@ -50,6 +59,59 @@ export const workflowWorktreePolicySchema = z.object({
 
 export type WorkflowWorktreePolicy = z.infer<typeof workflowWorktreePolicySchema>;
 
+/**
+ * Per-workflow container-backend policy (FOLDER projects only). Mirrors the
+ * worktree policy: a narrow per-workflow toggle; the runner image / caps live in
+ * repo/global `.archon/config.yaml > container` because they are install-wide.
+ *
+ * Selection precedence: CLI `--container` flag > this `container.enabled` >
+ * config `container.enabled` default (false). `container.write_back` chooses how
+ * the finished run's overlay diff reaches the live root (gated vs auto).
+ */
+export const workflowContainerPolicySchema = z.object({
+  /**
+   * Pin the container backend on for this folder-project workflow without the
+   * `--container` flag. Precedence is `--container flag ?? this ?? config ?? false`:
+   * `true` enables it (unless already forced by the flag); OMITTED defers to the
+   * config default; `false` HARD-disables it relative to config (the config
+   * default is not consulted), though an explicit `--container` flag still wins.
+   */
+  enabled: z.boolean().optional(),
+  /**
+   * How a finished container run's overlay changes reach the live folder root:
+   *  - `approve` (default) — pause at an engine-level write-back gate presenting
+   *    the change summary; the run applies to the live root only on approval and
+   *    discards on rejection.
+   *  - `auto` — apply the overlay diff to the live root without pausing (logged).
+   *    For unattended workflows that accept ungated write-back.
+   * Only consulted for container runs; a no-op for in-place / worktree runs.
+   */
+  write_back: z.enum(['approve', 'auto']).optional(),
+});
+
+export type WorkflowContainerPolicy = z.infer<typeof workflowContainerPolicySchema>;
+
+// ---------------------------------------------------------------------------
+// Workflow-level evidence policy (#2230)
+// ---------------------------------------------------------------------------
+
+/**
+ * Terminal-success evidence gate. When `required: true`, the DAG executor
+ * refuses to flip the run to `completed` unless `$ARTIFACTS_DIR/evidence.json`
+ * exists — a missing file marks the run `failed` with a structured note at
+ * `metadata.evidence_validation`. The engine gates ONLY on file presence:
+ * producing (and validating the content of) the evidence belongs to the
+ * workflow's own bash/script nodes (constitution: code computes, YAML
+ * coordinates). Deliberately narrow — no schema validation, no content checks,
+ * no configurable path (deferred until the gate sees adoption; see #2230).
+ */
+export const workflowEvidencePolicySchema = z.object({
+  /** Refuse terminal `completed` unless `$ARTIFACTS_DIR/evidence.json` exists. */
+  required: z.boolean(),
+});
+
+export type WorkflowEvidencePolicy = z.infer<typeof workflowEvidencePolicySchema>;
+
 // ---------------------------------------------------------------------------
 // WorkflowBase — common fields shared by all workflow types
 // ---------------------------------------------------------------------------
@@ -61,7 +123,6 @@ export const workflowBaseSchema = z.object({
   model: z.string().optional(),
   modelReasoningEffort: modelReasoningEffortSchema.optional(),
   webSearchMode: webSearchModeSchema.optional(),
-  additionalDirectories: z.array(z.string()).optional(),
   interactive: z.boolean().optional(),
   effort: effortLevelSchema.optional(),
   thinking: thinkingConfigSchema.optional(),
@@ -69,6 +130,8 @@ export const workflowBaseSchema = z.object({
   betas: betasSchema.optional(),
   sandbox: sandboxSettingsSchema.optional(),
   worktree: workflowWorktreePolicySchema.optional(),
+  container: workflowContainerPolicySchema.optional(),
+  evidence_policy: workflowEvidencePolicySchema.optional(),
   /**
    * When `false`, the engine skips the path-exclusive lock for this workflow,
    * allowing N concurrent runs on the same live checkout. The author asserts
@@ -83,6 +146,13 @@ export const workflowBaseSchema = z.object({
    */
   persist_sessions: z.boolean().optional(),
   tags: z.array(z.string().min(1)).optional(),
+  /**
+   * External capabilities this workflow needs. When it includes `github`, the
+   * run is hard-blocked at invocation (before any worktree/clone/AI cost) if
+   * the originating user has not connected their GitHub identity. Only enforced
+   * when per-user GitHub is enabled; a no-op for solo PAT installs.
+   */
+  requires: z.array(workflowRequirementSchema).optional(),
 });
 
 export type WorkflowBase = z.infer<typeof workflowBaseSchema>;

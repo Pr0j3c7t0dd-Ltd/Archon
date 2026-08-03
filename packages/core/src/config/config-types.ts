@@ -20,6 +20,7 @@ import type {
   PiProviderDefaults,
   ProviderDefaultsMap,
 } from '@archon/providers/types';
+import type { RawAliasesConfig, RawTiersConfig } from '@archon/workflows/model-validation';
 
 export type {
   ClaudeProviderDefaults,
@@ -28,6 +29,7 @@ export type {
   PiProviderDefaults,
   ProviderDefaultsMap,
 };
+export type { RawAliasesConfig, RawTiersConfig };
 
 /**
  * Intersection type: generic `ProviderDefaultsMap` (any string key) with
@@ -61,6 +63,48 @@ export type AssistantDefaults = ProviderDefaultsMap & {
   codex: CodexProviderDefaults;
 };
 
+/**
+ * Container isolation backend settings (folder projects only). Valid on both
+ * global and repo config; repo overrides global per-field. Defaults are applied
+ * when the CLI builds the backend config, not here (all fields optional).
+ */
+export interface ContainerConfig {
+  /**
+   * Runner image tag. Defaults to `archon-runner:latest` — the `build:runner-image`
+   * script tags both `archon-runner:<version>` and `:latest`, and defaulting to
+   * `:latest` avoids coupling to the dev-vs-binary version string. Pin an explicit
+   * version tag here for reproducibility.
+   * @default 'archon-runner:latest'
+   */
+  image?: string;
+
+  /**
+   * Container network mode. `none` disables egress; `bridge` is default NAT.
+   * @default 'bridge'
+   */
+  network?: 'bridge' | 'none';
+
+  /**
+   * Hard memory cap in MiB (`docker run --memory <n>m`).
+   * @default 4096
+   */
+  memoryMb?: number;
+
+  /**
+   * Process cap (`docker run --pids-limit <n>`) — a fork-bomb guard.
+   * @default 512
+   */
+  pidsLimit?: number;
+
+  /**
+   * Opt folder projects into the container backend WITHOUT the `--container`
+   * flag. The flag still wins when passed; workflow-level `container.enabled`
+   * sits between the flag and this config default.
+   * @default false
+   */
+  enabled?: boolean;
+}
+
 export interface GlobalConfig {
   /**
    * Bot display name (shown in messages)
@@ -78,6 +122,19 @@ export interface GlobalConfig {
    * Assistant-specific defaults (model, reasoning effort, etc.)
    */
   assistants?: AssistantDefaultsConfig;
+
+  /**
+   * Named model aliases accessible in workflow/node `model:` fields.
+   * Keys must use `@<name>` prefix (e.g. `@cheap`) — bare names are not
+   * reachable as aliases. Reserved names (enforced at runtime): small, medium, large.
+   */
+  aliases?: RawAliasesConfig;
+
+  /**
+   * Cross-provider model tier presets accessible as small/medium/large in
+   * workflow/node `model:` fields.
+   */
+  tiers?: RawTiersConfig;
 
   /**
    * Platform streaming preferences (can be overridden per conversation)
@@ -115,6 +172,12 @@ export interface GlobalConfig {
      */
     maxConversations?: number;
   };
+
+  /**
+   * Container isolation backend defaults (folder projects). Repo config
+   * overrides these per-field.
+   */
+  container?: ContainerConfig;
 }
 
 /**
@@ -132,6 +195,12 @@ export interface RepoConfig {
    * Assistant-specific defaults for this repository
    */
   assistants?: AssistantDefaultsConfig;
+
+  /** Repo-level model aliases — override global aliases with same name. */
+  aliases?: RawAliasesConfig;
+
+  /** Repo-level model tier presets — override global tiers with same name. */
+  tiers?: RawTiersConfig;
 
   /**
    * Commands configuration
@@ -201,6 +270,20 @@ export interface RepoConfig {
      * @example '.worktrees'
      */
     path?: string;
+
+    /**
+     * Git remote name for fetch/push operations.
+     *
+     * When set, all git operations (fetch, push, branch tracking) use this
+     * remote instead of 'origin'. Useful for repos with multiple remotes or
+     * non-standard naming conventions.
+     *
+     * When omitted, auto-detected: 'origin' if it exists, otherwise the sole
+     * remote if only one is configured.
+     *
+     * @example 'upstream'
+     */
+    remote?: string;
   };
 
   /**
@@ -215,11 +298,25 @@ export interface RepoConfig {
   };
 
   /**
+   * Container isolation backend settings for this repo (folder projects).
+   * Overrides global `container` per-field.
+   */
+  container?: ContainerConfig;
+
+  /**
    * Per-project environment variables injected into Claude SDK subprocess env.
    * Values here override process.env for workflow node execution.
    * Sensitive — do not commit actual secrets to version-controlled repos.
    */
   env?: Record<string, string>;
+
+  /**
+   * Repo-owner-curated list of recommended workflow names, in display order.
+   * Pinned on top of both the Workflows page and the sidebar run dropdown
+   * under a "Recommended for this project" header. Names not matching any
+   * discovered workflow are silently ignored (advisory).
+   */
+  recommendedWorkflows?: string[];
 
   /**
    * Default commands/workflows configuration
@@ -257,6 +354,16 @@ export interface MergedConfig {
   botName: string;
   assistant: string;
   assistants: AssistantDefaults;
+  /**
+   * Merged aliases (repo > global). Used by buildAiProfile at execution time.
+   * Undefined when no aliases are configured anywhere.
+   */
+  aliases?: RawAliasesConfig;
+  /**
+   * Merged model tiers (repo > global). Used by buildAiProfile at execution time.
+   * Undefined when no tiers are configured anywhere.
+   */
+  tiers?: RawTiersConfig;
   streaming: {
     telegram: 'stream' | 'batch';
     discord: 'stream' | 'batch';
@@ -289,6 +396,12 @@ export interface MergedConfig {
    */
   baseBranch?: string;
   /**
+   * Git remote name from repo config (worktree.remote).
+   * When undefined, callers auto-detect at runtime via getDefaultRemote()
+   * or fall back to 'origin'.
+   */
+  remote?: string;
+  /**
    * Docs directory path from repo config (docs.path).
    * Used for $DOCS_DIR substitution in workflow commands.
    * @default 'docs/'
@@ -300,6 +413,12 @@ export interface MergedConfig {
    * Undefined when no env vars are configured.
    */
   envVars?: Record<string, string>;
+  /**
+   * Merged container backend settings (repo `container` over global `container`,
+   * per-field). Raw optional fields — defaults are applied where the container
+   * config is consumed (CLI folder branch). Undefined when nothing is configured.
+   */
+  container?: ContainerConfig;
 }
 
 /**
@@ -323,4 +442,14 @@ export interface SafeConfig {
     loadDefaultCommands: boolean;
     loadDefaultWorkflows: boolean;
   };
+  /** Configured small/medium/large tier presets (merged repo > global). */
+  tiers?: RawTiersConfig;
+  /**
+   * Built-in tier presets for the current default provider (from
+   * tier-defaults.json via buildAiProfile). Lets the editor show what an
+   * unset tier resolves to without the web bundle importing @archon/workflows.
+   */
+  tierDefaults?: RawTiersConfig;
+  /** Configured @custom model aliases (merged repo > global). Not secrets. */
+  aliases?: RawAliasesConfig;
 }

@@ -7,6 +7,7 @@
 import { describe, it, expect } from 'bun:test';
 import { parseArgs } from 'util';
 import * as git from '@archon/git';
+import { tmpdir } from 'node:os';
 
 // Test the argument parsing logic used in cli.ts
 describe('CLI argument parsing', () => {
@@ -22,6 +23,7 @@ describe('CLI argument parsing', () => {
         branch: { type: 'string', short: 'b' },
         from: { type: 'string' },
         'from-branch': { type: 'string' },
+        base: { type: 'string' },
         'no-worktree': { type: 'boolean' },
         spawn: { type: 'boolean' },
         quiet: { type: 'boolean', short: 'q' },
@@ -150,6 +152,11 @@ describe('CLI argument parsing', () => {
       ]);
       expect(result.values.from).toBe('feature/primary');
       expect(result.values['from-branch']).toBe('feature/secondary');
+    });
+
+    it('should parse --base flag for workflow run', () => {
+      const result = parseCliArgs(['workflow', 'run', 'assist', '--base', 'epic/foo']);
+      expect(result.values.base).toBe('epic/foo');
     });
   });
 
@@ -398,9 +405,11 @@ describe('CLI git repo check', () => {
     });
 
     it('should return null for system directories outside any git repo', async () => {
-      // /tmp is typically not inside a git repo
-      // Note: This test may need adjustment if /tmp happens to be inside a repo
-      const result = await git.findRepoRoot('/tmp');
+      // The OS temp dir is not inside a git repo on any supported platform.
+      // Hardcoding '/tmp' fails on Windows, where that path does not exist —
+      // this file was absent from the package test script until #2384, so the
+      // POSIX assumption never surfaced in CI.
+      const result = await git.findRepoRoot(tmpdir());
       expect(result).toBeNull();
     });
   });
@@ -412,7 +421,7 @@ describe('CLI git repo check', () => {
 
     it('should detect existing directories', () => {
       expect(existsSync(process.cwd())).toBe(true);
-      expect(existsSync('/tmp')).toBe(true);
+      expect(existsSync(tmpdir())).toBe(true);
     });
 
     it('should detect non-existent directories', () => {

@@ -128,7 +128,7 @@ docker compose --profile with-db up -d
 ```
 
 Then add to `.env`:
-```env
+```ini
 DATABASE_URL=postgresql://postgres:postgres@postgres:5432/remote_coding_agent
 ```
 
@@ -320,6 +320,8 @@ To disable, leave `CADDY_BASIC_AUTH` empty or unset — the Caddyfile expands it
 
 ### Form-Based Authentication (HTML Login Page)
 
+> **PostgreSQL deployments:** prefer native [Web UI login via Better Auth](/reference/configuration/#web-ui-login-better-auth-optional) (`BETTER_AUTH_SECRET`), which supersedes this single-user `auth-service` sidecar with real per-user accounts. Self-serve signup is **disabled by default** — invite teammates with `ARCHON_AUTH_ALLOWED_EMAILS` (an allowlist) or open it explicitly with `ARCHON_AUTH_OPEN_SIGNUP=true`. When enabled, Better Auth also **gates the API server-side** (every `/api/*` request needs a session or gets `401`), so it can fully replace this `forward_auth` sidecar — see the sidecar-retirement runbook in the [Security reference](/reference/security/#adapter-authorization). The sidecar below still works (and remains the option for SQLite/solo installs) but is no longer the recommended path on Postgres.
+
 An alternative to basic auth that serves a styled HTML login form instead of the browser's credential popup. Uses a lightweight `auth-service` sidecar and Caddy's `forward_auth` directive.
 
 **When to use form auth vs basic auth:**
@@ -348,9 +350,11 @@ An alternative to basic auth that serves a styled HTML login form instead of the
 
    ```ini
    AUTH_USERNAME=admin
-   AUTH_PASSWORD_HASH=$2b$12$REPLACE_WITH_YOUR_HASH
+   AUTH_PASSWORD_HASH=$$2b$$12$$REPLACE_WITH_YOUR_HASH
    COOKIE_SECRET=REPLACE_WITH_64_HEX_CHARS
    ```
+
+   Escape every `$` in the bcrypt hash as `$$`; otherwise Docker Compose treats it as variable interpolation.
 
 4. Update `Caddyfile` (copy from `Caddyfile.example` if not done yet):
 
@@ -491,7 +495,7 @@ mkdir -p /opt/archon-user-home
 sudo chown -R 1001:1001 /opt/archon-user-home
 ```
 
-The entrypoint re-applies ownership on every container start, so subsequent rebuilds work without re-running `chown`.
+The entrypoint fixes ownership on every container start, touching only files whose owner is wrong, so startup stays fast even on large volumes. Subsequent rebuilds work without re-running `chown`.
 
 :::caution
 Bind-mount paths do **not** inherit the image's baked `~/.gitconfig` (Docker only copies image content into named volumes on first creation, never into bind mounts). The entrypoint still registers git `safe.directory` entries for `/.archon/workspaces` and `/.archon/worktrees` repos at runtime, so functionality is preserved — but a bind-mounted `~/.gitconfig` starts empty and any author identity / signing config you want must be set explicitly with `git config --global` inside the container.
@@ -509,6 +513,54 @@ PI_CODING_AGENT_DIR=/.archon/pi
 ```
 
 This must be set before the container starts; the Pi SDK reads the variable on each file path lookup.
+
+### Root fallback for macOS bind mounts (opt-in)
+
+On every start the entrypoint fixes ownership of `/.archon` and `/home/appuser` so they are writable by `appuser` (UID 1001), then drops privileges. On **macOS bind mounts (VirtioFS)** this ownership fix always fails — the host controls file ownership and refuses to remap host UIDs to the container's UID 1001 — so the container exits 1 and crash-loops. Read-only mounts and SELinux/AppArmor denials on Linux fail the same way.
+
+`ARCHON_ALLOW_ROOT_FALLBACK` is the explicit escape hatch for this case:
+
+```ini
+# .env — opt in to running as root when the ownership fix fails
+ARCHON_ALLOW_ROOT_FALLBACK=1
+```
+
+| Value | Behavior when the ownership fix fails |
+|-------|----------------------------------------|
+| unset / anything but `1` (default) | Print the underlying `chown` error and exit 1 (fail loud — unchanged) |
+| `1` | Print a warning, `export IS_SANDBOX=1`, and continue running as **root** (privileges are not dropped to `appuser`) |
+
+The variable has **no effect** when the ownership fix succeeds — Linux setups with correct volume ownership are untouched.
+
+:::caution
+This is a deliberate security tradeoff and is **never auto-enabled**. Running as root also sets `IS_SANDBOX=1`, which bypasses the Claude provider's UID-0 safety guard (it otherwise refuses `bypassPermissions` as root) — so AI subprocesses run as root inside the container. That is acceptable on a single-operator macOS dev machine where the bind mount already scopes what the container can touch; it is the wrong fix on Linux, where the failure means the volume ownership is actually broken — run `sudo chown -R 1001:1001 <path>` on the host instead of opting in.
+:::
+
+### Folder-project container isolation (`--container`) is unavailable in Docker
+
+The folder-project **container backend** (`archon workflow run … --container`) launches a
+sibling Docker container per run to isolate a workflow's writes. It shells out to the
+`docker` CLI, which needs both the Docker CLI binary and access to the host Docker daemon
+socket (`/var/run/docker.sock`).
+
+**When Archon itself runs inside Docker (this compose stack), `--container` does not work:**
+the app image ships no `docker` CLI and the compose stack deliberately does **not** mount
+`/var/run/docker.sock`. A `--container` run fails fast at preflight with a
+"Cannot connect to the Docker daemon" error (the message calls out the dockerized case).
+Worktree isolation (the default for git repos) and in-place folder runs are unaffected —
+only the `--container` backend requires the daemon.
+
+:::caution
+Mounting the Docker socket into the app container to enable `--container` is a serious
+security tradeoff and is **not** part of the supported compose stack. The socket is
+**root-equivalent**: any process that can reach it can start a privileged container and
+take over the host. Combined with the `native`-overlay CAP_SYS_ADMIN escape, this widens
+the blast radius well beyond a single run. If you accept that tradeoff on a single-tenant,
+operator-trusted host, read `packages/isolation/docker/SECURITY.md` first — it documents
+the full threat model for the container backend. To use `--container` without exposing the
+socket, run Archon **directly on the host** (non-Docker install) with a local Docker daemon
+instead.
+:::
 
 ### GitHub CLI Authentication
 
@@ -701,11 +753,15 @@ When using `--profile with-db`, ensure:
 
 ### Permission errors in `/.archon/`
 
-The container runs as `appuser` (UID 1001). If using bind mounts instead of Docker volumes:
+The container runs as `appuser` (UID 1001). The entrypoint tries to fix ownership of `/.archon` and `/home/appuser` on every start and exits 1 (with the underlying `chown` error) when it can't.
+
+**On Linux** with bind mounts instead of Docker volumes, fix the ownership on the host:
 
 ```bash
 sudo chown -R 1001:1001 /path/to/archon-data
 ```
+
+**On macOS** (Docker Desktop / VirtioFS bind mounts), host `chown` does **not** help — the host refuses to remap ownership to the container's UID 1001 no matter what the files are owned by on the host. For that case (and other failures `chown` can't fix, like read-only mounts or SELinux/AppArmor denials), see [Root fallback for macOS bind mounts (opt-in)](#root-fallback-for-macos-bind-mounts-opt-in).
 
 ### Port conflicts
 

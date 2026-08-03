@@ -2,15 +2,21 @@
 -- Version: Combined (final state after migrations 001-020)
 -- Description: Complete database schema (idempotent - safe to run multiple times)
 --
--- 8 Tables:
+-- 14 Tables (+ the remote_agent_auth_* Better Auth tables, listed inline below):
 --   1. remote_agent_codebases
 --   1b. remote_agent_codebase_env_vars
+--   1c. remote_agent_users
+--   1d. remote_agent_user_identities
 --   2. remote_agent_conversations
 --   3. remote_agent_sessions
 --   4. remote_agent_isolation_environments
 --   5. remote_agent_workflow_runs
 --   6. remote_agent_workflow_events
+--   6b. remote_agent_workflow_node_sessions
 --   7. remote_agent_messages
+--   8. remote_agent_user_github_tokens
+--   9. remote_agent_user_provider_keys
+--   10. remote_agent_user_ai_prefs
 --
 -- Dropped tables (via migrations):
 --   - remote_agent_command_templates (017)
@@ -29,7 +35,9 @@ CREATE TABLE IF NOT EXISTS remote_agent_codebases (
   name VARCHAR(255) NOT NULL,
   repository_url VARCHAR(500),
   default_cwd VARCHAR(500) NOT NULL,
+  default_branch VARCHAR(255),
   ai_assistant_type VARCHAR(20) DEFAULT 'claude',
+  kind VARCHAR(10) NOT NULL DEFAULT 'repo' CHECK (kind IN ('repo', 'folder')),
   allow_env_keys BOOLEAN NOT NULL DEFAULT FALSE,
   commands JSONB DEFAULT '{}'::jsonb,
   created_at TIMESTAMP DEFAULT NOW(),
@@ -37,7 +45,7 @@ CREATE TABLE IF NOT EXISTS remote_agent_codebases (
 );
 
 COMMENT ON TABLE remote_agent_codebases IS
-  'Repository metadata: name, URL, working directory, AI assistant type, and command paths (JSONB)';
+  'Repository metadata: name, URL, working directory, default branch, AI assistant type, and command paths (JSONB)';
 
 -- ============================================================================
 -- Table 1b: Codebase Env Vars
@@ -224,10 +232,11 @@ CREATE TABLE IF NOT EXISTS remote_agent_workflow_runs (
   conversation_id UUID REFERENCES remote_agent_conversations(id) ON DELETE CASCADE,
   codebase_id UUID REFERENCES remote_agent_codebases(id) ON DELETE SET NULL,
   current_step_index INTEGER,
-  status VARCHAR(20) NOT NULL DEFAULT 'pending',  -- pending, running, completed, failed
+  status VARCHAR(20) NOT NULL DEFAULT 'pending',  -- pending, running, completed, failed, cancelled, paused
   user_message TEXT NOT NULL,
   metadata JSONB DEFAULT '{}',
   parent_conversation_id UUID REFERENCES remote_agent_conversations(id) ON DELETE SET NULL,
+  parent_run_id UUID REFERENCES remote_agent_workflow_runs(id) ON DELETE SET NULL,
   started_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   completed_at TIMESTAMP WITH TIME ZONE,
   last_activity_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -256,6 +265,7 @@ COMMENT ON TABLE remote_agent_workflow_runs IS
 CREATE TABLE IF NOT EXISTS remote_agent_workflow_events (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   workflow_run_id UUID NOT NULL REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,
+  event_order BIGINT,
   event_type VARCHAR(50) NOT NULL,
   step_index INTEGER,
   step_name VARCHAR(255),
@@ -267,6 +277,13 @@ CREATE INDEX IF NOT EXISTS idx_workflow_events_run_id
   ON remote_agent_workflow_events(workflow_run_id);
 CREATE INDEX IF NOT EXISTS idx_workflow_events_type
   ON remote_agent_workflow_events(event_type);
+-- Global created_at index for the dashboard event poller's cross-run tail
+-- (WHERE created_at >= $1 ORDER BY created_at ASC).
+CREATE INDEX IF NOT EXISTS idx_workflow_events_created_at
+  ON remote_agent_workflow_events(created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_events_run_order
+  ON remote_agent_workflow_events(workflow_run_id, event_order)
+  WHERE event_order IS NOT NULL;
 
 COMMENT ON TABLE remote_agent_workflow_events IS
   'Lean UI-relevant workflow events for observability (step transitions, artifacts, errors)';
@@ -372,6 +389,16 @@ ALTER TABLE remote_agent_sessions
 ALTER TABLE remote_agent_codebases
   ADD COLUMN IF NOT EXISTS allow_env_keys BOOLEAN NOT NULL DEFAULT FALSE;
 
+-- From migration 023: detected default branch on codebases
+ALTER TABLE remote_agent_codebases
+  ADD COLUMN IF NOT EXISTS default_branch VARCHAR(255);
+
+-- From migration 024: project kind discriminator ('repo' | 'folder').
+-- Folder projects are non-git workspaces (multi-repo roots or plain ops folders)
+-- that run in place with named artifact/log storage under _folder/<slug>/.
+ALTER TABLE remote_agent_codebases
+  ADD COLUMN IF NOT EXISTS kind VARCHAR(10) NOT NULL DEFAULT 'repo';
+
 -- User identity foreign keys (nullable on the four primary tables).
 -- All FKs use ON DELETE SET NULL so future user deletion never cascades destructively.
 ALTER TABLE remote_agent_conversations
@@ -391,3 +418,207 @@ CREATE INDEX IF NOT EXISTS idx_conversations_user_id
   ON remote_agent_conversations(user_id) WHERE user_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_workflow_runs_user_id
   ON remote_agent_workflow_runs(user_id) WHERE user_id IS NOT NULL;
+
+-- Run-tree parent (#2121 Phase 2): a `workflow:` sub-run links back to the run
+-- that spawned it. Self-referential FK, ON DELETE SET NULL so deleting a parent
+-- orphans children rather than cascade-deleting their audit trail. First
+-- self-referential FK on this table — declared identically on SQLite (sqlite.ts).
+ALTER TABLE remote_agent_workflow_runs
+  ADD COLUMN IF NOT EXISTS parent_run_id UUID
+    REFERENCES remote_agent_workflow_runs(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_parent_run
+  ON remote_agent_workflow_runs(parent_run_id) WHERE parent_run_id IS NOT NULL;
+
+-- From PR-C: per-user GitHub user-to-server tokens (device flow), encrypted at rest.
+-- One row per Archon user; cascades on user deletion. github_user_id is the
+-- numeric anchor for the commit no-reply email (survives username changes).
+CREATE TABLE IF NOT EXISTS remote_agent_user_github_tokens (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES remote_agent_users(id) ON DELETE CASCADE,
+  github_user_id BIGINT NOT NULL,
+  github_login VARCHAR(255) NOT NULL,
+  access_token_encrypted TEXT NOT NULL,
+  refresh_token_encrypted TEXT,
+  access_token_expires_at TIMESTAMP WITH TIME ZONE,
+  refresh_token_expires_at TIMESTAMP WITH TIME ZONE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  UNIQUE(user_id)
+);
+
+-- Phase 2: per-user AI-provider credentials (BYO API key + subscription login),
+-- encrypted at rest with the existing token-crypto key. One row per
+-- (user_id, provider); cascades on user deletion. Exactly one of
+-- api_key_encrypted / oauth_creds_encrypted is populated per row; `kind`
+-- records which. Gated on TOKEN_ENCRYPTION_KEY at the application layer.
+CREATE TABLE IF NOT EXISTS remote_agent_user_provider_keys (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES remote_agent_users(id) ON DELETE CASCADE,
+  provider VARCHAR(64) NOT NULL,
+  kind VARCHAR(16) NOT NULL,
+  api_key_encrypted TEXT,
+  oauth_creds_encrypted TEXT,
+  label VARCHAR(255),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  UNIQUE(user_id, provider)
+);
+
+-- #1955: credential rows are vendor-keyed (claude→anthropic, codex→openai,
+-- copilot→github-copilot) so one credential can serve every agent that
+-- consumes the vendor. Idempotent data fix: where both a legacy and a vendor
+-- row exist for the same user, the vendor row wins (rare — requires having
+-- connected both ids pre-rename); then legacy rows are renamed in place.
+-- Tested on SQLite (adapters/sqlite.test.ts covers rename, conflict, and
+-- idempotency); the Postgres DML below is the same statements but is NOT
+-- covered by an automated test — verified manually on the multi-user smoke.
+-- Survivable either way: reads normalize legacy ids (normalizeCredentialVendor).
+DELETE FROM remote_agent_user_provider_keys
+WHERE provider IN ('claude', 'codex', 'copilot')
+  AND EXISTS (
+    SELECT 1 FROM remote_agent_user_provider_keys v
+    WHERE v.user_id = remote_agent_user_provider_keys.user_id
+      AND v.provider = CASE remote_agent_user_provider_keys.provider
+        WHEN 'claude' THEN 'anthropic'
+        WHEN 'codex' THEN 'openai'
+        WHEN 'copilot' THEN 'github-copilot'
+      END
+  );
+UPDATE remote_agent_user_provider_keys SET provider = 'anthropic' WHERE provider = 'claude';
+UPDATE remote_agent_user_provider_keys SET provider = 'openai' WHERE provider = 'codex';
+UPDATE remote_agent_user_provider_keys SET provider = 'github-copilot' WHERE provider = 'copilot';
+
+-- Phase 3: per-user AI preferences (model tiers, @custom aliases, default
+-- assistant). NON-encrypted — model names are not secrets (mirrors
+-- codebase_env_vars, not the provider-key store). One row per user; cascades
+-- on user deletion. `tiers` / `aliases` are JSON-as-TEXT (parsed in the
+-- store layer so SQLite and Postgres behave identically).
+CREATE TABLE IF NOT EXISTS remote_agent_user_ai_prefs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES remote_agent_users(id) ON DELETE CASCADE,
+  tiers TEXT,
+  aliases TEXT,
+  default_provider VARCHAR(64),
+  default_model VARCHAR(255),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  UNIQUE(user_id)
+);
+
+-- #1998: per-user default CHAT model, written atomically with
+-- default_provider (a model pin is only meaningful for the provider it was
+-- set with). Idempotent upgrade for installs that created the table before
+-- this column existed.
+ALTER TABLE remote_agent_user_ai_prefs
+  ADD COLUMN IF NOT EXISTS default_model VARCHAR(255);
+
+-- ============================================================================
+-- Web auth (opt-in): role on the canonical user + Better Auth tables
+-- ============================================================================
+--
+-- `role` is the durable identity seam: everyone defaults to 'admin' for now;
+-- 'member' is reserved for future per-resource scoping. Visibility stays open.
+ALTER TABLE remote_agent_users
+  ADD COLUMN IF NOT EXISTS role VARCHAR(16) NOT NULL DEFAULT 'admin';
+
+-- Lifecycle ordering (#2359 follow-up): timestamps can tie, especially on
+-- SQLite (one-second precision), so a database-assigned order breaks the tie and
+-- preserves event chronology. `id` cannot serve this role — it is a random UUID,
+-- not monotonic.
+--
+-- Deliberately a plain column plus a sequence DEFAULT, NOT `GENERATED ... AS
+-- IDENTITY`. Adding an identity column REWRITES the whole table under ACCESS
+-- EXCLUSIVE (verified on postgres:18: relfilenode changes), and this is the
+-- largest table in the schema while the schema auto-applies on startup — that is
+-- a boot-time stall proportional to event history. ADD COLUMN with no default is
+-- metadata-only, and SET DEFAULT afterwards applies to future inserts only.
+--
+-- It also keeps both databases honest: existing rows stay NULL on Postgres AND
+-- SQLite, so the COALESCE(event_order, 0) fallback in read queries behaves
+-- identically. An identity column would have back-filled Postgres rows (1, 2,
+-- 3...) while SQLite left them NULL.
+ALTER TABLE remote_agent_workflow_events
+  ADD COLUMN IF NOT EXISTS event_order BIGINT;
+CREATE SEQUENCE IF NOT EXISTS remote_agent_workflow_events_event_order_seq
+  OWNED BY remote_agent_workflow_events.event_order;
+ALTER TABLE remote_agent_workflow_events
+  ALTER COLUMN event_order SET DEFAULT nextval('remote_agent_workflow_events_event_order_seq');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_events_run_order
+  ON remote_agent_workflow_events(workflow_run_id, event_order)
+  WHERE event_order IS NOT NULL;
+
+-- ============================================================================
+-- Schema vintage (#2316)
+-- ============================================================================
+--
+-- Which Archon build created this database, and which last applied schema to it.
+-- Diagnostic only — nothing gates, refuses, or warns on these values. Single row
+-- (id = 1); the row's VALUES are written by the adapters from APP_VERSION
+-- (packages/core/src/db/schema-version.ts) so the version string has exactly one
+-- source of truth. created_app_version is NULL for databases that predate this
+-- table and is never back-filled with a guess.
+CREATE TABLE IF NOT EXISTS remote_agent_schema_version (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  created_app_version VARCHAR(64),
+  app_version VARCHAR(64) NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  applied_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE remote_agent_schema_version IS
+  'Diagnostic schema vintage: the Archon build that created this database and the one that last applied schema to it.';
+
+-- Better Auth tables (PostgreSQL only). Generated by `@better-auth/cli generate`
+-- against packages/server/src/auth/instance.ts (modelName-renamed to the
+-- `remote_agent_auth_*` prefix), then made idempotent with IF NOT EXISTS so the
+-- bundled-schema auto-apply on startup converges. Better Auth owns these tables
+-- and the column shape (text ids, camelCase columns) — Archon never queries them
+-- directly; a session is mapped to the canonical remote_agent_users row via
+-- user_identities('web', <betterAuthUserId>). Always created on Postgres (the
+-- IF NOT EXISTS apply runs on every boot); populated only when web auth is
+-- enabled (BETTER_AUTH_SECRET + DATABASE_URL), harmless empty tables otherwise.
+CREATE TABLE IF NOT EXISTS remote_agent_auth_user (
+  "id" text NOT NULL PRIMARY KEY,
+  "name" text NOT NULL,
+  "email" text NOT NULL UNIQUE,
+  "emailVerified" boolean NOT NULL,
+  "image" text,
+  "createdAt" timestamptz DEFAULT CURRENT_TIMESTAMP NOT NULL,
+  "updatedAt" timestamptz DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS remote_agent_auth_session (
+  "id" text NOT NULL PRIMARY KEY,
+  "expiresAt" timestamptz NOT NULL,
+  "token" text NOT NULL UNIQUE,
+  "createdAt" timestamptz DEFAULT CURRENT_TIMESTAMP NOT NULL,
+  "updatedAt" timestamptz NOT NULL,
+  "ipAddress" text,
+  "userAgent" text,
+  "userId" text NOT NULL REFERENCES remote_agent_auth_user ("id") ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS remote_agent_auth_account (
+  "id" text NOT NULL PRIMARY KEY,
+  "accountId" text NOT NULL,
+  "providerId" text NOT NULL,
+  "userId" text NOT NULL REFERENCES remote_agent_auth_user ("id") ON DELETE CASCADE,
+  "accessToken" text,
+  "refreshToken" text,
+  "idToken" text,
+  "accessTokenExpiresAt" timestamptz,
+  "refreshTokenExpiresAt" timestamptz,
+  "scope" text,
+  "password" text,
+  "createdAt" timestamptz DEFAULT CURRENT_TIMESTAMP NOT NULL,
+  "updatedAt" timestamptz NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS remote_agent_auth_verification (
+  "id" text NOT NULL PRIMARY KEY,
+  "identifier" text NOT NULL,
+  "value" text NOT NULL,
+  "expiresAt" timestamptz NOT NULL,
+  "createdAt" timestamptz DEFAULT CURRENT_TIMESTAMP NOT NULL,
+  "updatedAt" timestamptz DEFAULT CURRENT_TIMESTAMP NOT NULL
+);

@@ -115,6 +115,36 @@ Archon refuses to start if both modes are configured. Remove `GITHUB_TOKEN` from
 3. Trigger a webhook from a repo where the App is installed (e.g. comment `@archon ping` on an issue).
 4. Confirm the bot's reply appears as `<slug>[bot]` with the App badge in the GitHub UI.
 
+## Step 8 (optional): Enable per-user GitHub identity
+
+By default every comment, commit, and push goes through the **bot** (`<slug>[bot]`). On a multi-user install you can let each teammate connect their own GitHub identity so those actions attribute to the human instead.
+
+Enable the feature by adding two env vars on top of App mode:
+
+```bash
+# The App's Client ID (App settings → "Client ID", starts with Iv1./Iv23…).
+# Distinct from the numeric GITHUB_APP_ID.
+GITHUB_APP_CLIENT_ID=Iv23xxxxxxxxxxxx
+# 32-byte key used to encrypt stored per-user tokens at rest (AES-256-GCM).
+TOKEN_ENCRYPTION_KEY=$(openssl rand -hex 32)
+```
+
+Then, on the GitHub App settings page, enable **Device Flow** (under "Identifying and authorizing users"). The feature gate activates when `GITHUB_APP_ID` and `TOKEN_ENCRYPTION_KEY` are both set; `GITHUB_APP_CLIENT_ID` is required for the connect flow itself.
+
+Teammates connect once via any surface:
+
+- **CLI:** `archon auth github`
+- **Slack:** `/archon connect github`
+- **Web UI:** Settings → **Connect GitHub**
+
+Once enabled:
+
+- Workflows declaring `requires: [github]` **hard-block** unconnected users before any worktree/clone/AI cost.
+- An unconnected user's workflow `gh`/`git` has its GitHub token **scrubbed** by default (rather than silently using the shared org/bot token). Opt back into the shared token with `ARCHON_ALLOW_ORG_GITHUB_TOKEN_FALLBACK=true`.
+- Rotating `TOKEN_ENCRYPTION_KEY` invalidates all stored user tokens — everyone must reconnect.
+
+This is fully backward compatible: leave the two vars unset and the App keeps working as the bot only. See the [configuration reference](/reference/configuration/#per-user-github-identity-app-mode-optional) for the full env var table.
+
 ## Operational notes
 
 ### Token rotation is invisible
@@ -146,7 +176,7 @@ Archon enforces this at startup: with App mode active and the server bound to a 
 
 Example Caddy snippet that drops `/internal/*` (bare-metal):
 
-```caddyfile
+```txt
 example.com {
   @internal path /internal/*
   respond @internal 404
@@ -173,7 +203,7 @@ The `!override` tag (compose-spec) replaces the base file's `ports` list instead
 
 Insert this `handle` block before the fallthrough `handle { }` block:
 
-```caddyfile
+```txt
 handle /internal/* {
   respond "Not Found" 404
 }
@@ -222,7 +252,7 @@ If the external POST probe returns anything other than `404` or `403` from the p
 2. Add `GITHUB_APP_*` env vars (Step 6).
 3. **Remove** `GITHUB_TOKEN` from your env (or comment it out). Archon refuses to start if both are set.
 4. Restart Archon.
-5. Webhook URLs configured per-repo against the PAT-mode setup can stay or be removed — the App's single webhook URL covers everything once it's installed. New repos auto-join via App installation.
+5. Webhook URLs configured per-repo against the PAT-mode setup can stay or be removed — the App's single webhook URL covers everything once it's installed. New repos auto-join via App installation. While both webhooks are active, a comment delivered by each is deduplicated at ingest, so the bot still responds once.
 
 ## Troubleshooting
 

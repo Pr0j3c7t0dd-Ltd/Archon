@@ -13,6 +13,11 @@ concurrency:
 jobs:
   test:
     strategy:
+      # Both legs must always report. With the default fail-fast, an ubuntu
+      # failure cancels windows, so a windows-only break stays invisible until
+      # the next round — and a cancelled leg blocks a merge once it is a
+      # required check.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
@@ -30,6 +35,18 @@ jobs:
       - name: Check bundled defaults
         run: bun run check:bundled
 
+      - name: Check bundled skill
+        run: bun run check:bundled-skill
+
+      - name: Check bundled schema
+        run: bun run check:bundled-schema
+
+      - name: Check Pi vendor map
+        run: bun run check:pi-vendor-map
+
+      - name: Check provider capability matrix
+        run: bun run check:capability-matrix
+
       - name: Type check
         run: bun run type-check
 
@@ -38,6 +55,14 @@ jobs:
 
       - name: Check formatting
         run: bun run format:check
+
+      - name: Run installer tests
+        # POSIX-shell installer only. scripts/install.sh refuses MINGW/MSYS by design
+        # (Windows users are directed to WSL2), and test-install.sh runs the real
+        # installer with only curl mocked — so on windows-latest `uname -s` reports
+        # MINGW64_NT, the installer exits, and `set -euo pipefail` fails the job.
+        if: runner.os != 'Windows'
+        run: bun run test:install
 
       - name: Run tests
         run: bun run test
@@ -49,6 +74,17 @@ jobs:
       actions: write
     steps:
       - uses: actions/checkout@v4
+
+      # The image build needs ~14GB more scratch space than a stock runner has
+      # free once the provider SDKs' multi-platform vendor binaries are in
+      # node_modules. Cached-layer builds squeak by; any PR that invalidates an
+      # early Dockerfile layer (apt block, base image) rebuilds everything and
+      # hits "no space left on device". Reclaim the big unused toolchains first.
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

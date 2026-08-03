@@ -3,9 +3,30 @@
  */
 import { Pool } from 'pg';
 import type { PoolClient } from 'pg';
-import type { IDatabase, QueryResult, SqlDialect } from './types';
+import type { DbNotificationListener, IDatabase, QueryResult, SqlDialect } from './types';
 import { createLogger } from '@archon/paths';
 import { getSchemaSQL } from '../bundled-schema';
+import { APP_VERSION } from '../schema-version';
+
+/**
+ * Postgres-only: NOTIFY `archon_dashboard_event` on every workflow_events insert, so
+ * the server's PgNotifyListener can wake the dashboard poller to stream events from
+ * out-of-process (CLI) runs in real time. Idempotent (CREATE OR REPLACE + DROP IF
+ * EXISTS) — applied on every boot. Deliberately NOT in the shared bundled schema:
+ * SQLite has no triggers/NOTIFY, and this syntax would break its schema init.
+ */
+const WORKFLOW_EVENT_NOTIFY_SQL = `
+CREATE OR REPLACE FUNCTION archon_notify_workflow_event() RETURNS trigger AS $$
+BEGIN
+  PERFORM pg_notify('archon_dashboard_event', NEW.workflow_run_id::text);
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS archon_workflow_event_notify ON remote_agent_workflow_events;
+CREATE TRIGGER archon_workflow_event_notify
+  AFTER INSERT ON remote_agent_workflow_events
+  FOR EACH ROW EXECUTE FUNCTION archon_notify_workflow_event();
+`;
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -14,7 +35,7 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
-export class PostgresAdapter implements IDatabase {
+export class PostgresAdapter implements IDatabase, DbNotificationListener {
   private pool: Pool;
   // Schema convergence runs once on construction; every query() and
   // withTransaction() awaits this promise so the first DB op cannot race init.
@@ -54,9 +75,16 @@ export class PostgresAdapter implements IDatabase {
       // Key 1796 is arbitrary — just needs to be stable across processes.
       await client.query('BEGIN');
       await client.query('SELECT pg_advisory_xact_lock(1796)');
+      // Probe before applying: afterwards every table exists, and a database that
+      // predates schema-version tracking is indistinguishable from a fresh one.
+      const probe = await client.query<{ exists: boolean }>(
+        "SELECT to_regclass('remote_agent_codebases') IS NOT NULL AS exists"
+      );
+      const preExisting = probe.rows[0]?.exists ?? false;
       // The SQL is fully idempotent (CREATE TABLE IF NOT EXISTS,
       // ADD COLUMN IF NOT EXISTS, CREATE INDEX IF NOT EXISTS).
       await client.query(sql);
+      await this.recordSchemaVersion(client, preExisting);
       await client.query('COMMIT');
       getLog().info('db.postgres_schema_init_completed');
     } catch (e) {
@@ -76,6 +104,76 @@ export class PostgresAdapter implements IDatabase {
       const err = e instanceof Error ? e : new Error(String(e));
       getLog().fatal({ err }, 'db.postgres_schema_init_failed');
       throw err;
+    } finally {
+      client?.release();
+    }
+    // Best-effort, AFTER the core schema commits: a role without CREATE FUNCTION/
+    // TRIGGER must not fail boot — the dashboard poller's interval backstop still
+    // streams CLI runs, just without the instant LISTEN/NOTIFY push.
+    await this.installNotifyTrigger();
+  }
+
+  /**
+   * Record which Archon build created this database and which last applied schema
+   * to it (#2316). Runs inside the caller's advisory-locked schema transaction so
+   * concurrent boots stay serialized. ON CONFLICT never touches created_app_version,
+   * so the creation vintage is written once and never revised; the DO UPDATE is a
+   * no-op when the app version has not changed.
+   *
+   * Behind a SAVEPOINT on purpose: the vintage row is diagnostic metadata and a
+   * failure to write it must not abort the schema transaction. Without this, a throw
+   * here would reject `schemaInitPromise` — which every query()/withTransaction()
+   * awaits — bricking the adapter for the life of the process over a row nothing
+   * gates on. Mirrors the warn-and-continue guarantee the SQLite adapter gives.
+   */
+  private async recordSchemaVersion(client: PoolClient, preExisting: boolean): Promise<void> {
+    await client.query('SAVEPOINT schema_version');
+    try {
+      await client.query(
+        `INSERT INTO remote_agent_schema_version (id, created_app_version, app_version)
+         VALUES (1, $1, $2)
+         ON CONFLICT (id) DO UPDATE
+           SET app_version = EXCLUDED.app_version, applied_at = NOW()
+           WHERE remote_agent_schema_version.app_version IS DISTINCT FROM EXCLUDED.app_version`,
+        [preExisting ? null : APP_VERSION, APP_VERSION]
+      );
+      await client.query('RELEASE SAVEPOINT schema_version');
+    } catch (e) {
+      await client.query('ROLLBACK TO SAVEPOINT schema_version');
+      getLog().warn(
+        { err: e instanceof Error ? e : new Error(String(e)) },
+        'db.postgres_schema_version_record_failed'
+      );
+    }
+  }
+
+  /**
+   * Install the Postgres-only `pg_notify` trigger on workflow_events (real-time
+   * dashboard push). Idempotent and non-fatal — its own advisory-locked txn so
+   * concurrent boots don't race on DROP/CREATE TRIGGER.
+   */
+  private async installNotifyTrigger(): Promise<void> {
+    let client: PoolClient | undefined;
+    try {
+      client = await this.pool.connect();
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(1797)');
+      await client.query(WORKFLOW_EVENT_NOTIFY_SQL);
+      await client.query('COMMIT');
+      getLog().info('db.postgres_notify_trigger_installed');
+    } catch (e) {
+      if (client) {
+        try {
+          await client.query('ROLLBACK');
+        } catch {
+          /* best-effort cleanup */
+        }
+      }
+      getLog().warn(
+        { err: e instanceof Error ? e : new Error(String(e)) },
+        'db.postgres_notify_trigger_install_failed'
+      );
+      // Non-fatal — degrade to poll-only.
     } finally {
       client?.release();
     }
@@ -122,6 +220,56 @@ export class PostgresAdapter implements IDatabase {
 
   async close(): Promise<void> {
     await this.pool.end();
+  }
+
+  /**
+   * Subscribe to a Postgres `LISTEN` channel on a dedicated, held connection.
+   * The client is never returned to the pool's normal rotation — it stays
+   * checked out so it keeps receiving notifications, and is destroyed (not
+   * recycled) on unsubscribe or error.
+   */
+  async listen(
+    channel: string,
+    onNotify: (payload: string) => void,
+    onError: (err: Error) => void
+  ): Promise<() => void> {
+    await this.schemaInitPromise;
+    // `LISTEN` cannot be parameterized — validate the channel name to keep it
+    // out of injection territory (we only ever pass a fixed constant).
+    if (!/^[a-z_][a-z0-9_]*$/i.test(channel)) {
+      throw new Error(`Invalid LISTEN channel name: ${channel}`);
+    }
+    const client = await this.pool.connect();
+    let released = false;
+    const release = (destroy: boolean | Error): void => {
+      if (released) return;
+      released = true;
+      client.removeAllListeners('notification');
+      client.removeAllListeners('error');
+      // Destroy rather than return to the pool — a LISTEN client must not be reused.
+      client.release(destroy);
+    };
+    try {
+      client.on('notification', msg => {
+        if (msg.channel === channel) onNotify(msg.payload ?? '');
+      });
+      client.on('error', err => {
+        const e = err instanceof Error ? err : new Error(String(err));
+        getLog().warn({ err: e, channel }, 'db.postgres_listen_client_error');
+        release(e);
+        onError(e);
+      });
+      // If LISTEN setup throws, release the checked-out client so a flaky reconnect
+      // loop can't exhaust the pool (max 10) and stall all DB work.
+      await client.query(`LISTEN ${channel}`);
+    } catch (err) {
+      const e = err instanceof Error ? err : new Error(String(err));
+      release(e);
+      throw e;
+    }
+    return () => {
+      release(true);
+    };
   }
 }
 

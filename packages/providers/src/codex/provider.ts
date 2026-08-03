@@ -8,6 +8,7 @@ import {
   type ThreadOptions,
   type TurnOptions,
   type TurnCompletedEvent,
+  type ThreadStartedEvent,
 } from '@openai/codex-sdk';
 import type {
   IAgentProvider,
@@ -21,6 +22,11 @@ import { CODEX_CAPABILITIES } from './capabilities';
 import { resolveCodexBinaryPath } from './binary-resolver';
 import { createLogger } from '@archon/paths';
 import { loadMcpConfig } from '../mcp/config';
+import {
+  hasOpenAdditionalProperties,
+  normalizeJsonSchemaForOpenAiStrict,
+} from '../shared/structured-output';
+import { withResumedOutcome, resumedOutcome } from '../shared/resumed';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -204,8 +210,12 @@ function buildCodexMcpConfigOverrides(
   return { mcp_servers: mcpServers };
 }
 
+// Maps slugs that ChatGPT-plan accounts now reject (previously shipped as Archon
+// suggestions/defaults) to a current, plan-accepted slug to suggest instead.
 const CODEX_MODEL_FALLBACKS: Record<string, string> = {
-  'gpt-5.3-codex': 'gpt-5.2-codex',
+  'gpt-5.3-codex': 'gpt-5.6-sol',
+  'gpt-5.2-codex': 'gpt-5.6-sol',
+  'gpt-5.2': 'gpt-5.6-sol',
 };
 
 function isModelAccessError(errorMessage: string): boolean {
@@ -278,14 +288,31 @@ function buildTurnOptions(requestOptions?: SendQueryOptions): {
   hasOutputFormat: boolean;
 } {
   const turnOptions: TurnOptions = {};
+  // Preserve the original precedence: an explicit `outputFormat` wins over
+  // `nodeConfig.output_format` even when its `.schema` is undefined. Note the
+  // resulting asymmetry: if `outputFormat` is set but `.schema` is undefined,
+  // `rawSchema` is undefined (no schema sent) yet `hasOutputFormat` is still
+  // true — the stream accumulator runs and JSON.parses the response text.
+  const rawSchema =
+    requestOptions?.outputFormat !== undefined
+      ? requestOptions.outputFormat.schema
+      : requestOptions?.nodeConfig?.output_format;
   const hasOutputFormat = !!(
     requestOptions?.outputFormat ?? requestOptions?.nodeConfig?.output_format
   );
-  if (requestOptions?.outputFormat) {
-    turnOptions.outputSchema = requestOptions.outputFormat.schema;
-  }
-  if (requestOptions?.nodeConfig?.output_format && !requestOptions?.outputFormat) {
-    turnOptions.outputSchema = requestOptions.nodeConfig.output_format;
+  if (rawSchema !== undefined) {
+    // OpenAI Structured Outputs strict-mode requires additionalProperties:false
+    // on every object schema (HTTP 400 invalid_json_schema otherwise). Workflow
+    // authors write portable output_format schemas, so normalize here before
+    // handing the schema to the Codex SDK. See issue #1843.
+    if (hasOpenAdditionalProperties(rawSchema)) {
+      // The normalizer is about to rewrite an open-record `additionalProperties`
+      // (e.g. `{ type: 'string' }` or `true`) to `false`. OpenAI would 400 the
+      // open form anyway, but the author never declared a closed object — warn
+      // so the silent narrowing is visible rather than a surprise at runtime.
+      getLog().warn({ schema: rawSchema }, 'codex.output_format_open_record_closed');
+    }
+    turnOptions.outputSchema = normalizeJsonSchemaForOpenAiStrict(rawSchema);
   }
   // Signal assignment is intentionally per-attempt (in sendQuery's retry
   // loop), not here. Reusing a single AbortSignal across retries can poison
@@ -294,11 +321,64 @@ function buildTurnOptions(requestOptions?: SendQueryOptions): {
   return { turnOptions, hasOutputFormat };
 }
 
+// ─── Effective Prompt Builder ────────────────────────────────────────────
+
+/**
+ * Fold the request/node-level systemPrompt into the user prompt.
+ *
+ * The Codex SDK (verified at @openai/codex-sdk 0.144.5) exposes NO
+ * instructions/system-prompt channel on ThreadOptions or TurnOptions, so the
+ * only delivery mechanism is prepending to the prompt string, separated by
+ * the same `---` delimiter augmentPromptForJsonSchema uses. See issue #1837.
+ *
+ * Precedence mirrors the Pi provider: request-level systemPrompt wins over
+ * node-level. Only string / string[] are supported; SystemPromptPreset
+ * objects are Claude-specific and dropped with a WARN (the orchestrator
+ * already sends non-Claude providers a plain string).
+ *
+ * The prepend intentionally repeats on EVERY turn, including resumed
+ * threads: the provider cannot know whether a resumed session's earlier
+ * turns carried the instructions (the session may predate this fix), and
+ * both the resume-failure fallback and cold retry attempts start fresh
+ * threads where first-turn-only logic would drop the instructions exactly
+ * when they are most needed. This matches Claude, which receives the
+ * systemPrompt on every query.
+ */
+function buildEffectivePrompt(prompt: string, requestOptions?: SendQueryOptions): string {
+  const raw = requestOptions?.systemPrompt ?? requestOptions?.nodeConfig?.systemPrompt;
+  if (raw === undefined) {
+    return prompt;
+  }
+  let systemText: string | undefined;
+  if (typeof raw === 'string') {
+    systemText = raw;
+  } else if (Array.isArray(raw)) {
+    systemText = raw.join('\n\n');
+  }
+  if (systemText === undefined) {
+    getLog().warn({ systemPromptType: typeof raw }, 'codex.system_prompt_dropped_preset');
+    return prompt;
+  }
+  if (systemText.trim() === '') {
+    return prompt;
+  }
+  return `${systemText}\n\n---\n\n${prompt}`;
+}
+
 // ─── Stream Normalizer ───────────────────────────────────────────────────
 
 /** State maintained across Codex event stream normalization. */
 interface CodexStreamState {
   lastTodoListSignature?: string;
+  startedToolItemIds: Set<string>;
+  completedToolItemIds: Set<string>;
+}
+
+function getMcpToolName(item: Record<string, unknown>): string {
+  const server = item.server as string | undefined;
+  const tool = item.tool as string | undefined;
+  const toolInfo = server && tool ? `${server}/${tool}` : (tool ?? server ?? 'MCP tool');
+  return `🔌 MCP: ${toolInfo}`;
 }
 
 /**
@@ -312,8 +392,18 @@ async function* streamCodexEvents(
   abortSignal?: AbortSignal,
   surfaceMcpClientErrors = false
 ): AsyncGenerator<MessageChunk> {
-  const state: CodexStreamState = {};
+  const state: CodexStreamState = {
+    startedToolItemIds: new Set<string>(),
+    completedToolItemIds: new Set<string>(),
+  };
   let accumulatedText = '';
+
+  // A new thread's id is assigned during the run via the `thread.started` event
+  // (the SDK emits it only for new threads), not synchronously on startThread().
+  // Capture it so the terminal result chunk surfaces a resumable sessionId —
+  // persist_session and suspend/resume depend on it. A resumed thread keeps the
+  // snapshot id (no thread.started fires), so the seeded value stays correct.
+  let resolvedThreadId: string | null | undefined = threadId;
 
   if (abortSignal?.aborted) {
     getLog().info('query_aborted_before_stream');
@@ -333,12 +423,54 @@ async function* streamCodexEvents(
       throw new Error('Query aborted');
     }
 
+    if (event.type === 'thread.started') {
+      // Capture the new thread's id. Its SDK doc comment reads: "The identifier
+      // of the new thread. Can be used to resume the thread later." This is the
+      // only place a new thread's id surfaces. `continue` — the event carries no
+      // user-facing content, only this metadata.
+      const startedThreadId = (event as ThreadStartedEvent).thread_id;
+      if (startedThreadId) {
+        resolvedThreadId = startedThreadId;
+        getLog().info({ threadId: startedThreadId }, 'codex.thread_started');
+      } else {
+        // The SDK types thread_id as a non-empty string, so this should never
+        // fire. If it does, a new thread would surface sessionId: undefined and
+        // the dag-executor would treat the run as session-less — silently
+        // dropping any persist_session continuity. Warn rather than degrade
+        // quietly (CLAUDE.md: Fail Fast + Explicit Errors).
+        getLog().warn({ snapshotThreadId: resolvedThreadId }, 'codex.thread_started_missing_id');
+      }
+      continue;
+    }
+
     if (event.type === 'item.started') {
-      const item = event.item as { type: string; id: string };
-      getLog().debug(
-        { eventType: event.type, itemType: item.type, itemId: item.id },
-        'item_started'
-      );
+      const item = event.item as Record<string, unknown>;
+      const itemType = item.type as string;
+      const itemId = item.id as string;
+      getLog().debug({ eventType: event.type, itemType, itemId }, 'item_started');
+
+      let toolName: string | undefined;
+      if (itemType === 'command_execution') {
+        if (typeof item.command === 'string' && item.command.length > 0) {
+          toolName = item.command;
+        } else {
+          getLog().warn({ itemId }, 'command_execution_missing_command');
+        }
+      } else if (itemType === 'web_search') {
+        if (typeof item.query === 'string' && item.query.length > 0) {
+          toolName = `🔍 Searching: ${item.query}`;
+        } else {
+          getLog().debug({ itemId }, 'web_search_missing_query');
+        }
+      } else if (itemType === 'mcp_tool_call') {
+        toolName = getMcpToolName(item);
+      }
+
+      if (toolName && itemId && !state.startedToolItemIds.has(itemId)) {
+        state.startedToolItemIds.add(itemId);
+        yield { type: 'tool', toolName, toolCallId: itemId };
+      }
+      continue;
     }
 
     if (event.type === 'error') {
@@ -367,7 +499,7 @@ async function* streamCodexEvents(
       getLog().error({ errorMessage }, 'turn_failed');
       yield {
         type: 'result',
-        sessionId: threadId ?? undefined,
+        sessionId: resolvedThreadId ?? undefined,
         isError: true,
         errorSubtype: 'codex_turn_failed',
         errors: [errorMessage],
@@ -389,10 +521,28 @@ async function* streamCodexEvents(
       }
       getLog().debug(logContext, 'item_completed');
 
+      const itemId = item.id as string;
+      const isToolItem =
+        itemType === 'command_execution' ||
+        itemType === 'web_search' ||
+        itemType === 'mcp_tool_call';
+      if (isToolItem) {
+        if (state.completedToolItemIds.has(itemId)) {
+          getLog().warn({ itemId, itemType }, 'tool_item_duplicate_completion');
+          continue;
+        }
+        state.completedToolItemIds.add(itemId);
+        if (!state.startedToolItemIds.has(itemId)) {
+          getLog().warn({ itemId, itemType }, 'tool_item_completed_without_start');
+        }
+      }
+
       switch (itemType) {
         case 'agent_message':
           if (item.text) {
-            if (hasOutputFormat) accumulatedText += item.text as string;
+            // Multiple agent_message items can arrive in one turn (preamble + answer);
+            // keep only the last — it's the authoritative structured-output candidate.
+            if (hasOutputFormat) accumulatedText = item.text as string;
             yield { type: 'assistant', content: item.text as string };
           }
           break;
@@ -400,7 +550,6 @@ async function* streamCodexEvents(
         case 'command_execution':
           if (item.command) {
             const cmd = item.command as string;
-            yield { type: 'tool', toolName: cmd };
             const exitCode = item.exit_code as number | null | undefined;
             const exitSuffix =
               exitCode != null && exitCode !== 0 ? `\n[exit code: ${String(exitCode)}]` : '';
@@ -408,6 +557,7 @@ async function* streamCodexEvents(
               type: 'tool_result',
               toolName: cmd,
               toolOutput: ((item.aggregated_output as string) ?? '') + exitSuffix,
+              toolCallId: itemId,
             };
           } else {
             getLog().warn({ itemId: item.id }, 'command_execution_missing_command');
@@ -423,8 +573,12 @@ async function* streamCodexEvents(
         case 'web_search':
           if (item.query) {
             const searchToolName = `🔍 Searching: ${item.query as string}`;
-            yield { type: 'tool', toolName: searchToolName };
-            yield { type: 'tool_result', toolName: searchToolName, toolOutput: '' };
+            yield {
+              type: 'tool_result',
+              toolName: searchToolName,
+              toolOutput: '',
+              toolCallId: itemId,
+            };
           } else {
             getLog().debug({ itemId: item.id }, 'web_search_missing_query');
           }
@@ -495,10 +649,7 @@ async function* streamCodexEvents(
         case 'mcp_tool_call': {
           const server = item.server as string | undefined;
           const tool = item.tool as string | undefined;
-          const toolInfo = server && tool ? `${server}/${tool}` : (tool ?? server ?? 'MCP tool');
-          const mcpToolName = `🔌 MCP: ${toolInfo}`;
-
-          yield { type: 'tool', toolName: mcpToolName };
+          const mcpToolName = getMcpToolName(item);
 
           if ((item.status as string) === 'failed') {
             getLog().warn(
@@ -509,7 +660,12 @@ async function* streamCodexEvents(
             const errMsg = mcpError?.message
               ? `❌ Error: ${mcpError.message}`
               : '❌ Error: MCP tool failed';
-            yield { type: 'tool_result', toolName: mcpToolName, toolOutput: errMsg };
+            yield {
+              type: 'tool_result',
+              toolName: mcpToolName,
+              toolOutput: errMsg,
+              toolCallId: itemId,
+            };
           } else {
             let toolOutput = '';
             const mcpResult = item.result as { content?: unknown } | undefined;
@@ -528,7 +684,7 @@ async function* streamCodexEvents(
                 );
               }
             }
-            yield { type: 'tool_result', toolName: mcpToolName, toolOutput };
+            yield { type: 'tool_result', toolName: mcpToolName, toolOutput, toolCallId: itemId };
           }
           break;
         }
@@ -563,7 +719,7 @@ async function* streamCodexEvents(
 
       yield {
         type: 'result',
-        sessionId: threadId ?? undefined,
+        sessionId: resolvedThreadId ?? undefined,
         tokens: usage,
         ...(structuredOutput !== undefined ? { structuredOutput } : {}),
       };
@@ -583,7 +739,7 @@ async function* streamCodexEvents(
   getLog().error({ message }, 'stream_incomplete');
   yield {
     type: 'result',
-    sessionId: threadId ?? undefined,
+    sessionId: resolvedThreadId ?? undefined,
     isError: true,
     errorSubtype: 'codex_stream_incomplete',
     errors: [message],
@@ -630,6 +786,7 @@ function classifyAndEnrichCodexError(
  * sendQuery orchestrates the following internal helpers:
  * - buildThreadOptions: SDK thread configuration
  * - buildTurnOptions: per-turn configuration (output schema, abort signal)
+ * - buildEffectivePrompt: systemPrompt delivery via prompt prepend (no SDK channel)
  * - streamCodexEvents: raw SDK event normalization into MessageChunks
  * - classifyAndEnrichCodexError: error classification for retry decisions
  */
@@ -757,8 +914,11 @@ export class CodexProvider implements IAgentProvider {
       };
     }
 
-    // 3. Build turn options
+    // 3. Build turn options and the effective prompt (systemPrompt prepend).
+    // Computed once before the retry loop so cold retry attempts, which start
+    // fresh threads, also carry the system instructions.
     const { turnOptions, hasOutputFormat } = buildTurnOptions(requestOptions);
+    const effectivePrompt = buildEffectivePrompt(prompt, requestOptions);
     let lastError: Error | undefined;
 
     for (let attempt = 0; attempt <= MAX_SUBPROCESS_RETRIES; attempt++) {
@@ -801,15 +961,21 @@ export class CodexProvider implements IAgentProvider {
 
         try {
           // 4. Run streamed turn
-          const result = await thread.runStreamed(prompt, turnOptions);
+          const result = await thread.runStreamed(effectivePrompt, turnOptions);
 
           // 5. Stream normalized events (fresh state per attempt to avoid dedup leaks)
-          yield* streamCodexEvents(
-            result.events as AsyncIterable<Record<string, unknown>>,
-            hasOutputFormat,
-            thread.id,
-            attemptController.signal,
-            Boolean(requestOptions?.nodeConfig?.mcp)
+          yield* withResumedOutcome(
+            streamCodexEvents(
+              result.events as AsyncIterable<Record<string, unknown>>,
+              hasOutputFormat,
+              thread.id,
+              attemptController.signal,
+              Boolean(requestOptions?.nodeConfig?.mcp)
+            ),
+            // Stamp from the attempt that produced the result: any retry
+            // (attempt > 0) re-runs on a fresh startThread (cold), so the prior
+            // session context is lost even when the initial resumeThread succeeded.
+            resumedOutcome(resumeSessionId, !sessionResumeFailed && attempt === 0)
           );
           return;
         } catch (error) {

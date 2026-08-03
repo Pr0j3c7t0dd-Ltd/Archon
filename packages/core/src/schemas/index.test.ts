@@ -105,6 +105,7 @@ describe('core schemas', () => {
       name: 'my-project',
       repository_url: 'https://github.com/user/repo',
       default_cwd: '/home/user/projects/my-project',
+      default_branch: 'main',
       ai_assistant_type: 'claude',
       commands: { plan: { path: '/cmds/plan.md', description: 'Plan' } },
       created_at: new Date(),
@@ -121,10 +122,23 @@ describe('core schemas', () => {
       id: 'user-1',
       display_name: 'Alice',
       email: 'alice@example.com',
+      role: 'admin',
       created_at: new Date(),
       updated_at: new Date(),
     });
     expect(result.success).toBe(true);
+  });
+
+  test('userRowSchema rejects an invalid role', () => {
+    const result = userRowSchema.safeParse({
+      id: 'user-1',
+      display_name: 'Alice',
+      email: 'alice@example.com',
+      role: 'superuser',
+      created_at: new Date(),
+      updated_at: new Date(),
+    });
+    expect(result.success).toBe(false);
   });
 
   test('userIdentityRowSchema accepts a valid row', () => {

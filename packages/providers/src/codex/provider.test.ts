@@ -77,16 +77,19 @@ describe('CodexProvider', () => {
         sessionResume: true,
         mcp: true,
         hooks: false,
-        skills: false,
+        skills: true,
         agents: false,
         toolRestrictions: false,
-        structuredOutput: true,
+        structuredOutput: 'enforced',
         envInjection: true,
         costControl: false,
         effortControl: false,
         thinkingControl: false,
         fallbackModel: false,
         sandbox: false,
+        settingSources: false,
+        nativeTools: false,
+        containerExec: false,
       });
     });
   });
@@ -117,12 +120,111 @@ describe('CodexProvider', () => {
       });
     });
 
+    test('captures the new-thread id from the thread.started event (resumable sessionId)', async () => {
+      // The real Codex SDK assigns a NEW thread's id during the run, via the
+      // thread.started event — not synchronously on startThread(). Simulate a
+      // thread whose .id is still null and assert the result carries the id from
+      // the event, so persist_session / suspend-resume have a resumable id.
+      mockStartThread.mockReturnValue({ id: null, runStreamed: mockRunStreamed });
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'thread.started', thread_id: 'evt-thread-id' };
+          yield {
+            type: 'item.completed',
+            item: { type: 'agent_message', text: 'stored' },
+          };
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('remember X', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks[chunks.length - 1]).toEqual({
+        type: 'result',
+        sessionId: 'evt-thread-id',
+        tokens: { input: 10, output: 5 },
+      });
+    });
+
+    test('captured thread id flows through the turn.failed result', async () => {
+      mockStartThread.mockReturnValue({ id: null, runStreamed: mockRunStreamed });
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'thread.started', thread_id: 'evt-thread-id' };
+          yield { type: 'turn.failed', error: { message: 'boom' } };
+        })(),
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('x', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks.find(c => c.type === 'result')).toMatchObject({
+        type: 'result',
+        sessionId: 'evt-thread-id',
+        isError: true,
+      });
+    });
+
+    test('captured thread id flows through the stream_incomplete result', async () => {
+      mockStartThread.mockReturnValue({ id: null, runStreamed: mockRunStreamed });
+      mockRunStreamed.mockResolvedValue({
+        // Stream closes without turn.completed/turn.failed → fail-stop result.
+        events: (async function* () {
+          yield { type: 'thread.started', thread_id: 'evt-thread-id' };
+        })(),
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('x', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks.find(c => c.type === 'result')).toMatchObject({
+        type: 'result',
+        sessionId: 'evt-thread-id',
+        isError: true,
+        errorSubtype: 'codex_stream_incomplete',
+      });
+    });
+
+    test('an empty thread.started thread_id keeps the snapshot id (guard)', async () => {
+      // Default startThread snapshot id is 'new-thread-id'; an empty event id
+      // must not overwrite it (and would otherwise warn, not emit sessionId: '').
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'thread.started', thread_id: '' };
+          yield { type: 'item.completed', item: { type: 'agent_message', text: 'ok' } };
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('x', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks.find(c => c.type === 'result')).toMatchObject({
+        type: 'result',
+        sessionId: 'new-thread-id',
+      });
+    });
+
     test('yields tool events from command_execution items', async () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
           yield {
+            type: 'item.started',
+            item: { id: 'cmd-1', type: 'command_execution', command: 'npm test' },
+          };
+          yield {
             type: 'item.completed',
             item: {
+              id: 'cmd-1',
               type: 'command_execution',
               command: 'npm test',
               aggregated_output: 'tests passed\n',
@@ -138,11 +240,12 @@ describe('CodexProvider', () => {
         chunks.push(chunk);
       }
 
-      expect(chunks[0]).toEqual({ type: 'tool', toolName: 'npm test' });
+      expect(chunks[0]).toEqual({ type: 'tool', toolName: 'npm test', toolCallId: 'cmd-1' });
       expect(chunks[1]).toEqual({
         type: 'tool_result',
         toolName: 'npm test',
         toolOutput: 'tests passed\n',
+        toolCallId: 'cmd-1',
       });
     });
 
@@ -150,8 +253,13 @@ describe('CodexProvider', () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
           yield {
+            type: 'item.started',
+            item: { id: 'cmd-2', type: 'command_execution', command: 'npm test' },
+          };
+          yield {
             type: 'item.completed',
             item: {
+              id: 'cmd-2',
               type: 'command_execution',
               command: 'npm test',
               aggregated_output: 'failure\n',
@@ -171,6 +279,7 @@ describe('CodexProvider', () => {
         type: 'tool_result',
         toolName: 'npm test',
         toolOutput: 'failure\n\n[exit code: 1]',
+        toolCallId: 'cmd-2',
       });
     });
 
@@ -196,7 +305,14 @@ describe('CodexProvider', () => {
     test('yields tool events from web_search items', async () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
-          yield { type: 'item.completed', item: { type: 'web_search', query: 'codex sdk' } };
+          yield {
+            type: 'item.started',
+            item: { id: 'search-1', type: 'web_search', query: 'codex sdk' },
+          };
+          yield {
+            type: 'item.completed',
+            item: { id: 'search-1', type: 'web_search', query: 'codex sdk' },
+          };
           yield { type: 'turn.completed', usage: defaultUsage };
         })(),
       });
@@ -206,11 +322,16 @@ describe('CodexProvider', () => {
         chunks.push(chunk);
       }
 
-      expect(chunks[0]).toEqual({ type: 'tool', toolName: '\u{1F50D} Searching: codex sdk' });
+      expect(chunks[0]).toEqual({
+        type: 'tool',
+        toolName: '\u{1F50D} Searching: codex sdk',
+        toolCallId: 'search-1',
+      });
       expect(chunks[1]).toEqual({
         type: 'tool_result',
         toolName: '\u{1F50D} Searching: codex sdk',
         toolOutput: '',
+        toolCallId: 'search-1',
       });
     });
 
@@ -396,12 +517,39 @@ describe('CodexProvider', () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
           yield {
-            type: 'item.completed',
-            item: { type: 'mcp_tool_call', server: 'fs', tool: 'readFile', status: 'in_progress' },
+            type: 'item.started',
+            item: {
+              id: 'mcp-1',
+              type: 'mcp_tool_call',
+              server: 'fs',
+              tool: 'readFile',
+              status: 'in_progress',
+            },
           };
           yield {
             type: 'item.completed',
             item: {
+              id: 'mcp-1',
+              type: 'mcp_tool_call',
+              server: 'fs',
+              tool: 'readFile',
+              status: 'completed',
+            },
+          };
+          yield {
+            type: 'item.started',
+            item: {
+              id: 'mcp-2',
+              type: 'mcp_tool_call',
+              server: 'fs',
+              tool: 'readFile',
+              status: 'in_progress',
+            },
+          };
+          yield {
+            type: 'item.completed',
+            item: {
+              id: 'mcp-2',
               type: 'mcp_tool_call',
               server: 'fs',
               tool: 'readFile',
@@ -418,19 +566,27 @@ describe('CodexProvider', () => {
         chunks.push(chunk);
       }
 
-      // First mcp call (in_progress on item.completed): start + empty result
-      expect(chunks[0]).toEqual({ type: 'tool', toolName: '\u{1F50C} MCP: fs/readFile' });
+      expect(chunks[0]).toEqual({
+        type: 'tool',
+        toolName: '\u{1F50C} MCP: fs/readFile',
+        toolCallId: 'mcp-1',
+      });
       expect(chunks[1]).toEqual({
         type: 'tool_result',
         toolName: '\u{1F50C} MCP: fs/readFile',
         toolOutput: '',
+        toolCallId: 'mcp-1',
       });
-      // Second mcp call (failed): start + error result so the UI card closes
-      expect(chunks[2]).toEqual({ type: 'tool', toolName: '\u{1F50C} MCP: fs/readFile' });
+      expect(chunks[2]).toEqual({
+        type: 'tool',
+        toolName: '\u{1F50C} MCP: fs/readFile',
+        toolCallId: 'mcp-2',
+      });
       expect(chunks[3]).toEqual({
         type: 'tool_result',
         toolName: '\u{1F50C} MCP: fs/readFile',
         toolOutput: '\u274C Error: Permission denied',
+        toolCallId: 'mcp-2',
       });
       expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.objectContaining({ server: 'fs', tool: 'readFile' }),
@@ -442,16 +598,28 @@ describe('CodexProvider', () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
           yield {
-            type: 'item.completed',
-            item: { type: 'mcp_tool_call', tool: 'readFile', status: 'in_progress' },
+            type: 'item.started',
+            item: { id: 'mcp-tool', type: 'mcp_tool_call', tool: 'readFile' },
           };
           yield {
             type: 'item.completed',
-            item: { type: 'mcp_tool_call', server: 'fs', status: 'in_progress' },
+            item: { id: 'mcp-tool', type: 'mcp_tool_call', tool: 'readFile', status: 'completed' },
+          };
+          yield {
+            type: 'item.started',
+            item: { id: 'mcp-server', type: 'mcp_tool_call', server: 'fs' },
           };
           yield {
             type: 'item.completed',
-            item: { type: 'mcp_tool_call', status: 'in_progress' },
+            item: { id: 'mcp-server', type: 'mcp_tool_call', server: 'fs', status: 'completed' },
+          };
+          yield {
+            type: 'item.started',
+            item: { id: 'mcp-unknown', type: 'mcp_tool_call' },
+          };
+          yield {
+            type: 'item.completed',
+            item: { id: 'mcp-unknown', type: 'mcp_tool_call', status: 'completed' },
           };
           yield { type: 'turn.completed', usage: defaultUsage };
         })(),
@@ -462,23 +630,38 @@ describe('CodexProvider', () => {
         chunks.push(chunk);
       }
 
-      expect(chunks[0]).toEqual({ type: 'tool', toolName: '\u{1F50C} MCP: readFile' });
+      expect(chunks[0]).toEqual({
+        type: 'tool',
+        toolName: '\u{1F50C} MCP: readFile',
+        toolCallId: 'mcp-tool',
+      });
       expect(chunks[1]).toEqual({
         type: 'tool_result',
         toolName: '\u{1F50C} MCP: readFile',
         toolOutput: '',
+        toolCallId: 'mcp-tool',
       });
-      expect(chunks[2]).toEqual({ type: 'tool', toolName: '\u{1F50C} MCP: fs' });
+      expect(chunks[2]).toEqual({
+        type: 'tool',
+        toolName: '\u{1F50C} MCP: fs',
+        toolCallId: 'mcp-server',
+      });
       expect(chunks[3]).toEqual({
         type: 'tool_result',
         toolName: '\u{1F50C} MCP: fs',
         toolOutput: '',
+        toolCallId: 'mcp-server',
       });
-      expect(chunks[4]).toEqual({ type: 'tool', toolName: '\u{1F50C} MCP: MCP tool' });
+      expect(chunks[4]).toEqual({
+        type: 'tool',
+        toolName: '\u{1F50C} MCP: MCP tool',
+        toolCallId: 'mcp-unknown',
+      });
       expect(chunks[5]).toEqual({
         type: 'tool_result',
         toolName: '\u{1F50C} MCP: MCP tool',
         toolOutput: '',
+        toolCallId: 'mcp-unknown',
       });
     });
 
@@ -486,8 +669,18 @@ describe('CodexProvider', () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
           yield {
+            type: 'item.started',
+            item: { id: 'mcp-failure', type: 'mcp_tool_call', server: 'db', tool: 'query' },
+          };
+          yield {
             type: 'item.completed',
-            item: { type: 'mcp_tool_call', server: 'db', tool: 'query', status: 'failed' },
+            item: {
+              id: 'mcp-failure',
+              type: 'mcp_tool_call',
+              server: 'db',
+              tool: 'query',
+              status: 'failed',
+            },
           };
           yield { type: 'turn.completed', usage: defaultUsage };
         })(),
@@ -498,11 +691,16 @@ describe('CodexProvider', () => {
         chunks.push(chunk);
       }
 
-      expect(chunks[0]).toEqual({ type: 'tool', toolName: '\u{1F50C} MCP: db/query' });
+      expect(chunks[0]).toEqual({
+        type: 'tool',
+        toolName: '\u{1F50C} MCP: db/query',
+        toolCallId: 'mcp-failure',
+      });
       expect(chunks[1]).toEqual({
         type: 'tool_result',
         toolName: '\u{1F50C} MCP: db/query',
         toolOutput: '\u274C Error: MCP tool failed',
+        toolCallId: 'mcp-failure',
       });
     });
 
@@ -510,8 +708,13 @@ describe('CodexProvider', () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
           yield {
+            type: 'item.started',
+            item: { id: 'mcp-completed', type: 'mcp_tool_call', server: 'fs', tool: 'readFile' },
+          };
+          yield {
             type: 'item.completed',
             item: {
+              id: 'mcp-completed',
               type: 'mcp_tool_call',
               server: 'fs',
               tool: 'readFile',
@@ -529,11 +732,16 @@ describe('CodexProvider', () => {
       }
 
       expect(chunks).toHaveLength(3);
-      expect(chunks[0]).toEqual({ type: 'tool', toolName: '\u{1F50C} MCP: fs/readFile' });
+      expect(chunks[0]).toEqual({
+        type: 'tool',
+        toolName: '\u{1F50C} MCP: fs/readFile',
+        toolCallId: 'mcp-completed',
+      });
       expect(chunks[1]).toEqual({
         type: 'tool_result',
         toolName: '\u{1F50C} MCP: fs/readFile',
         toolOutput: JSON.stringify([{ type: 'text', text: 'file contents' }]),
+        toolCallId: 'mcp-completed',
       });
       expect(chunks[2]).toEqual({
         type: 'result',
@@ -571,8 +779,9 @@ describe('CodexProvider', () => {
         })(),
       });
 
-      for await (const _ of client.sendQuery('test prompt', '/workspace', 'existing-thread')) {
-        // consume
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test prompt', '/workspace', 'existing-thread')) {
+        chunks.push(chunk);
       }
 
       expect(mockResumeThread).toHaveBeenCalledWith(
@@ -586,6 +795,10 @@ describe('CodexProvider', () => {
         })
       );
       expect(mockStartThread).not.toHaveBeenCalled();
+      // No thread.started re-fires on resume → the snapshot (resumeThread's id) survives.
+      expect(chunks.find(c => c.type === 'result')).toMatchObject({
+        sessionId: 'resumed-thread-id',
+      });
     });
 
     test('falls back to new thread when resume fails and notifies user', async () => {
@@ -629,7 +842,52 @@ describe('CodexProvider', () => {
         type: 'result',
         sessionId: 'fallback-thread',
         tokens: { input: 10, output: 5 },
+        // A requested resume that fell back to a fresh thread is reported as cold.
+        resumed: false,
       });
+    });
+
+    test('reports resumed:true on the result when an existing thread resumes', async () => {
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace', 'existing-thread')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks.find(c => c.type === 'result')).toMatchObject({ resumed: true });
+    });
+
+    test('reports resumed:false when a resumed thread retries cold after a transient crash', async () => {
+      // Attempt 0 resumes the thread, then the turn crashes. The retry re-runs on
+      // a fresh startThread (cold), so the produced result must report resumed:false
+      // rather than inheriting the initial resume's success (see CodeRabbit #1842).
+      let callCount = 0;
+      mockRunStreamed.mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          return Promise.reject(new Error('Codex Exec exited with code 1'));
+        }
+        return Promise.resolve({
+          events: (async function* () {
+            yield { type: 'turn.completed', usage: defaultUsage };
+          })(),
+        });
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace', 'existing-thread')) {
+        chunks.push(chunk);
+      }
+
+      expect(mockResumeThread).toHaveBeenCalled();
+      // The retry path created a fresh thread, dropping the resumed session context.
+      expect(mockStartThread).toHaveBeenCalled();
+      expect(chunks.find(c => c.type === 'result')).toMatchObject({ resumed: false });
     });
 
     test('passes model and codex options via assistantConfig to thread options', async () => {
@@ -640,7 +898,7 @@ describe('CodexProvider', () => {
       });
 
       for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
-        model: 'gpt-5.2-codex',
+        model: 'gpt-5.6-sol',
         assistantConfig: {
           modelReasoningEffort: 'medium',
           webSearchMode: 'live',
@@ -652,7 +910,7 @@ describe('CodexProvider', () => {
 
       expect(mockStartThread).toHaveBeenCalledWith(
         expect.objectContaining({
-          model: 'gpt-5.2-codex',
+          model: 'gpt-5.6-sol',
           modelReasoningEffort: 'medium',
           webSearchMode: 'live',
           additionalDirectories: ['/other/repo'],
@@ -660,7 +918,7 @@ describe('CodexProvider', () => {
       );
     });
 
-    test('passes outputFormat schema as outputSchema in TurnOptions', async () => {
+    test('normalizes outputFormat schema (adds additionalProperties:false) before sending as outputSchema', async () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
           yield { type: 'turn.completed', usage: defaultUsage };
@@ -669,7 +927,10 @@ describe('CodexProvider', () => {
 
       const schema = {
         type: 'object',
-        properties: { summary: { type: 'string' } },
+        properties: {
+          summary: { type: 'string' },
+          meta: { type: 'object', properties: { tag: { type: 'string' } } },
+        },
         required: ['summary'],
       };
 
@@ -680,9 +941,70 @@ describe('CodexProvider', () => {
         chunks.push(chunk);
       }
 
+      // OpenAI strict-mode requires additionalProperties:false on every object,
+      // including the nested `meta` object — verifies recursion through the
+      // real provider path. See issue #1843.
       expect(mockRunStreamed).toHaveBeenCalledWith(
         'test prompt',
-        expect.objectContaining({ outputSchema: schema })
+        expect.objectContaining({
+          outputSchema: {
+            type: 'object',
+            properties: {
+              summary: { type: 'string' },
+              meta: {
+                type: 'object',
+                properties: { tag: { type: 'string' } },
+                additionalProperties: false,
+              },
+            },
+            required: ['summary'],
+            additionalProperties: false,
+          },
+        })
+      );
+    });
+
+    test('normalizes nodeConfig.output_format schema before sending as outputSchema', async () => {
+      // The DAG executor populates nodeConfig.output_format (not outputFormat),
+      // so this is the actual path from issue #1843. Pin the normalized schema
+      // at the SDK boundary, not just the downstream parse.
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test prompt', '/workspace', undefined, {
+        nodeConfig: {
+          output_format: {
+            type: 'object',
+            properties: {
+              verdict: { type: 'string' },
+              meta: { type: 'object', properties: { score: { type: 'number' } } },
+            },
+          },
+        },
+      })) {
+        chunks.push(chunk);
+      }
+
+      expect(mockRunStreamed).toHaveBeenCalledWith(
+        'test prompt',
+        expect.objectContaining({
+          outputSchema: {
+            type: 'object',
+            properties: {
+              verdict: { type: 'string' },
+              meta: {
+                type: 'object',
+                properties: { score: { type: 'number' } },
+                additionalProperties: false,
+              },
+            },
+            additionalProperties: false,
+          },
+        })
       );
     });
 
@@ -998,7 +1320,10 @@ describe('CodexProvider', () => {
     test('logs progress for item.started and item.completed events', async () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
-          yield { type: 'item.started', item: { id: 'item-1', type: 'command_execution' } };
+          yield {
+            type: 'item.started',
+            item: { id: 'item-1', type: 'command_execution', command: 'npm test' },
+          };
           yield {
             type: 'item.completed',
             item: { id: 'item-1', type: 'command_execution', command: 'npm test' },
@@ -1025,6 +1350,90 @@ describe('CodexProvider', () => {
           command: 'npm test',
         },
         'item_completed'
+      );
+      expect(chunks[0]).toEqual({
+        type: 'tool',
+        toolName: 'npm test',
+        toolCallId: 'item-1',
+      });
+      expect(chunks[1]).toEqual({
+        type: 'tool_result',
+        toolName: 'npm test',
+        toolOutput: '',
+        toolCallId: 'item-1',
+      });
+    });
+
+    test('deduplicates repeated tool lifecycle events by item id', async () => {
+      const started = {
+        type: 'item.started',
+        item: { id: 'cmd-duplicate', type: 'command_execution', command: 'npm test' },
+      };
+      const completed = {
+        type: 'item.completed',
+        item: {
+          id: 'cmd-duplicate',
+          type: 'command_execution',
+          command: 'npm test',
+          aggregated_output: 'done',
+          exit_code: 0,
+        },
+      };
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield started;
+          yield started;
+          yield completed;
+          yield completed;
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks.filter(chunk => chunk.type === 'tool')).toHaveLength(1);
+      expect(chunks.filter(chunk => chunk.type === 'tool_result')).toHaveLength(1);
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        { itemId: 'cmd-duplicate', itemType: 'command_execution' },
+        'tool_item_duplicate_completion'
+      );
+    });
+
+    test('does not recreate a tool start when completion arrives alone', async () => {
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield {
+            type: 'item.completed',
+            item: {
+              id: 'cmd-completed-only',
+              type: 'command_execution',
+              command: 'npm test',
+              aggregated_output: 'done',
+              exit_code: 0,
+            },
+          };
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks.some(chunk => chunk.type === 'tool')).toBe(false);
+      expect(chunks[0]).toEqual({
+        type: 'tool_result',
+        toolName: 'npm test',
+        toolOutput: 'done',
+        toolCallId: 'cmd-completed-only',
+      });
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        { itemId: 'cmd-completed-only', itemType: 'command_execution' },
+        'tool_item_completed_without_start'
       );
     });
 
@@ -1278,7 +1687,7 @@ describe('CodexProvider', () => {
       await expect(consumeGenerator()).rejects.toThrow(
         'Model "gpt-5.3-codex" is not available for your account'
       );
-      await expect(consumeGenerator()).rejects.toThrow('model: gpt-5.2-codex');
+      await expect(consumeGenerator()).rejects.toThrow('model: gpt-5.6-sol');
     });
 
     test('uses generic dashboard guidance when fallback mapping is unknown', async () => {
@@ -1330,6 +1739,138 @@ describe('CodexProvider', () => {
         type: 'result',
         sessionId: 'new-thread-id',
         tokens: { input: 10, output: 5 },
+      });
+    });
+
+    describe('systemPrompt delivery (issue #1837)', () => {
+      // The Codex SDK has no instructions/system-prompt channel, so the
+      // provider must fold systemPrompt into the prompt string it hands to
+      // thread.runStreamed. These tests assert on that SDK boundary.
+      const seedRun = (): void => {
+        mockRunStreamed.mockResolvedValue({
+          events: (async function* () {
+            yield { type: 'turn.completed', usage: defaultUsage };
+          })(),
+        });
+      };
+
+      const drain = async (gen: AsyncGenerator<unknown>): Promise<void> => {
+        for await (const _ of gen) {
+          // consume
+        }
+      };
+
+      test('prepends a string systemPrompt to the prompt with a --- delimiter', async () => {
+        seedRun();
+
+        await drain(
+          client.sendQuery('test prompt', '/workspace', undefined, {
+            systemPrompt: 'AAA routing rules',
+          })
+        );
+
+        expect(mockRunStreamed).toHaveBeenCalledWith(
+          'AAA routing rules\n\n---\n\ntest prompt',
+          expect.anything()
+        );
+      });
+
+      test('joins a string[] systemPrompt with blank lines before prepending', async () => {
+        seedRun();
+
+        await drain(
+          client.sendQuery('test prompt', '/workspace', undefined, {
+            systemPrompt: ['part one', 'part two'],
+          })
+        );
+
+        expect(mockRunStreamed).toHaveBeenCalledWith(
+          'part one\n\npart two\n\n---\n\ntest prompt',
+          expect.anything()
+        );
+      });
+
+      test('drops a Claude-specific preset object with a WARN and keeps the prompt unchanged', async () => {
+        seedRun();
+
+        await drain(
+          client.sendQuery('test prompt', '/workspace', undefined, {
+            systemPrompt: { type: 'preset', preset: 'claude_code', append: 'extra' },
+          })
+        );
+
+        expect(mockRunStreamed).toHaveBeenCalledWith('test prompt', expect.anything());
+        expect(mockLogger.warn).toHaveBeenCalledWith(
+          expect.objectContaining({ systemPromptType: 'object' }),
+          'codex.system_prompt_dropped_preset'
+        );
+      });
+
+      test('passes the prompt unchanged when no systemPrompt is set', async () => {
+        seedRun();
+
+        await drain(client.sendQuery('test prompt', '/workspace'));
+
+        expect(mockRunStreamed).toHaveBeenCalledWith('test prompt', expect.anything());
+      });
+
+      test('passes the prompt unchanged when systemPrompt is whitespace-only', async () => {
+        seedRun();
+
+        await drain(
+          client.sendQuery('test prompt', '/workspace', undefined, {
+            systemPrompt: '   ',
+          })
+        );
+
+        expect(mockRunStreamed).toHaveBeenCalledWith('test prompt', expect.anything());
+      });
+
+      test('honors node-level nodeConfig.systemPrompt (workflow path)', async () => {
+        seedRun();
+
+        await drain(
+          client.sendQuery('test prompt', '/workspace', undefined, {
+            nodeConfig: { systemPrompt: 'node-level instructions' },
+          })
+        );
+
+        expect(mockRunStreamed).toHaveBeenCalledWith(
+          'node-level instructions\n\n---\n\ntest prompt',
+          expect.anything()
+        );
+      });
+
+      test('request-level systemPrompt wins over nodeConfig.systemPrompt', async () => {
+        seedRun();
+
+        await drain(
+          client.sendQuery('test prompt', '/workspace', undefined, {
+            systemPrompt: 'request-level',
+            nodeConfig: { systemPrompt: 'node-level' },
+          })
+        );
+
+        expect(mockRunStreamed).toHaveBeenCalledWith(
+          'request-level\n\n---\n\ntest prompt',
+          expect.anything()
+        );
+      });
+
+      test('prepends on resumed threads too (every turn, not first turn only)', async () => {
+        seedRun();
+
+        await drain(
+          client.sendQuery('follow-up prompt', '/workspace', 'existing-session-id', {
+            systemPrompt: 'AAA routing rules',
+          })
+        );
+
+        expect(mockResumeThread).toHaveBeenCalledWith('existing-session-id', expect.anything());
+        expect(mockRunStreamed).toHaveBeenCalledWith(
+          'AAA routing rules\n\n---\n\nfollow-up prompt',
+          expect.anything()
+        );
       });
     });
 
@@ -1504,6 +2045,79 @@ describe('CodexProvider', () => {
         expect(resultChunk).toBeDefined();
         expect(resultChunk!.type === 'result' && resultChunk!.structuredOutput).toEqual(
           jsonPayload
+        );
+      });
+
+      test('uses last agent_message when multiple messages are emitted with output_format', async () => {
+        const preamble = { claims_accurate: 'false', reasoning: "I'll verify first" };
+        const finalAnswer = {
+          claims_accurate: 'true',
+          reasoning: 'Checked — claims are correct',
+        };
+        mockRunStreamed.mockResolvedValueOnce({
+          events: (async function* () {
+            yield {
+              type: 'item.completed',
+              item: { type: 'agent_message', id: 'msg-1', text: JSON.stringify(preamble) },
+            };
+            yield {
+              type: 'item.completed',
+              item: { type: 'agent_message', id: 'msg-2', text: JSON.stringify(finalAnswer) },
+            };
+            yield { type: 'turn.completed', usage: defaultUsage };
+          })(),
+        });
+
+        const chunks = [];
+        for await (const chunk of client.sendQuery('test', '/tmp', undefined, {
+          outputFormat: { type: 'json_schema', schema: { type: 'object' } },
+        })) {
+          chunks.push(chunk);
+        }
+
+        const assistantChunks = chunks.filter(c => c.type === 'assistant');
+        expect(assistantChunks).toHaveLength(2);
+
+        const resultChunk = chunks.find(c => c.type === 'result');
+        expect(resultChunk).toBeDefined();
+        expect(resultChunk!.type === 'result' && resultChunk!.structuredOutput).toEqual(
+          finalAnswer
+        );
+
+        const systemChunk = chunks.find(c => c.type === 'system');
+        expect(systemChunk).toBeUndefined();
+      });
+
+      test('uses last agent_message when multiple messages are emitted via nodeConfig.output_format', async () => {
+        // Workflow path: dag-executor sets nodeConfig.output_format from YAML
+        // output_format. Locks the same last-wins fix on this entry point.
+        const preamble = { claims_accurate: 'false', reasoning: 'draft' };
+        const finalAnswer = { claims_accurate: 'true', reasoning: 'verified' };
+        mockRunStreamed.mockResolvedValueOnce({
+          events: (async function* () {
+            yield {
+              type: 'item.completed',
+              item: { type: 'agent_message', id: 'msg-1', text: JSON.stringify(preamble) },
+            };
+            yield {
+              type: 'item.completed',
+              item: { type: 'agent_message', id: 'msg-2', text: JSON.stringify(finalAnswer) },
+            };
+            yield { type: 'turn.completed', usage: defaultUsage };
+          })(),
+        });
+
+        const chunks = [];
+        for await (const chunk of client.sendQuery('test', '/tmp', undefined, {
+          nodeConfig: { output_format: { type: 'object' } },
+        })) {
+          chunks.push(chunk);
+        }
+
+        const resultChunk = chunks.find(c => c.type === 'result');
+        expect(resultChunk).toBeDefined();
+        expect(resultChunk!.type === 'result' && resultChunk!.structuredOutput).toEqual(
+          finalAnswer
         );
       });
     });

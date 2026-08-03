@@ -35,6 +35,9 @@ export interface HealthResponse {
   runningWorkflows: number;
   version?: string;
   is_docker: boolean;
+  is_wsl: boolean;
+  /** WSL distribution name (e.g. "Ubuntu") — only present when is_wsl is true. */
+  wsl_distro?: string;
   activePlatforms?: string[];
 }
 
@@ -55,7 +58,12 @@ async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {
 export interface ProviderInfo {
   id: string;
   displayName: string;
-  capabilities: Record<string, boolean>;
+  // Derived from the OpenAPI spec so the string-union `structuredOutput`
+  // ('enforced' | 'best-effort' | false) is typed honestly rather than widened
+  // to boolean. `Partial` because SettingsPage synthesizes placeholder entries
+  // for config-only providers with unknown capabilities ({}); the web never
+  // reads individual capability fields, only the API populates the full shape.
+  capabilities: Partial<components['schemas']['ProviderCapabilities']>;
   builtIn: boolean;
 }
 
@@ -67,6 +75,60 @@ export type UpdateAssistantConfigBody = components['schemas']['UpdateAssistantCo
 export async function listProviders(): Promise<ProviderInfo[]> {
   const data = await fetchJSON<{ providers: ProviderInfo[] }>('/api/providers');
   return data.providers;
+}
+
+// Web auth status (opt-in). Drives the login gate: when `enabled` is false the
+// UI renders exactly as before (no login). `signup` reports the invite posture:
+//   - 'allowlist' — invite-only (allowlisted emails)
+//   - 'open'      — anyone may register
+//   - 'disabled'  — self-serve signup is off (login only); hide signup UI
+export interface AuthStatus {
+  enabled: boolean;
+  signup: 'allowlist' | 'open' | 'disabled';
+}
+
+export async function getAuthStatus(): Promise<AuthStatus> {
+  return fetchJSON<AuthStatus>('/api/auth/status');
+}
+
+// GitHub device-flow connect
+export interface GithubDeviceStart {
+  device_code: string;
+  user_code: string;
+  verification_uri: string;
+  interval: number;
+  expires_in: number;
+}
+
+export interface GithubDevicePoll {
+  status: 'pending' | 'connected' | 'expired' | 'denied' | 'error';
+  githubLogin?: string;
+  detail?: string;
+}
+
+export interface GithubConnectionStatus {
+  connected: boolean;
+  githubLogin: string | null;
+}
+
+export async function getGithubConnection(): Promise<GithubConnectionStatus> {
+  return fetchJSON<GithubConnectionStatus>('/api/auth/github');
+}
+
+export async function startGithubDeviceFlow(): Promise<GithubDeviceStart> {
+  return fetchJSON<GithubDeviceStart>('/api/auth/github/device/start', { method: 'POST' });
+}
+
+export async function pollGithubDeviceFlow(deviceCode: string): Promise<GithubDevicePoll> {
+  return fetchJSON<GithubDevicePoll>('/api/auth/github/device/poll', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ device_code: deviceCode }),
+  });
+}
+
+export async function disconnectGithub(): Promise<{ success: boolean }> {
+  return fetchJSON<{ success: boolean }>('/api/auth/github', { method: 'DELETE' });
 }
 
 // Conversations
@@ -96,7 +158,7 @@ export async function updateConversation(
   id: string,
   updates: { title?: string }
 ): Promise<{ success: boolean }> {
-  return fetchJSON(`/api/conversations/${id}`, {
+  return fetchJSON(`/api/conversations/${encodeURIComponent(id)}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(updates),
@@ -104,7 +166,7 @@ export async function updateConversation(
 }
 
 export async function deleteConversation(id: string): Promise<{ success: boolean }> {
-  return fetchJSON(`/api/conversations/${id}`, { method: 'DELETE' });
+  return fetchJSON(`/api/conversations/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
 export async function sendMessage(
@@ -168,10 +230,19 @@ export type WorkflowEventResponse = components['schemas']['WorkflowEvent'];
 
 export type WorkflowListEntry = components['schemas']['WorkflowListEntry'];
 
-export async function listWorkflows(cwd?: string): Promise<WorkflowListEntry[]> {
+export interface WorkflowListResult {
+  workflows: WorkflowListEntry[];
+  /** Repo-owner-curated names from `.archon/config.yaml`, declared order. */
+  recommended: string[];
+}
+
+export async function listWorkflows(cwd?: string): Promise<WorkflowListResult> {
   const params = cwd ? `?cwd=${encodeURIComponent(cwd)}` : '';
-  const result = await fetchJSON<{ workflows: WorkflowListEntry[] }>(`/api/workflows${params}`);
-  return result.workflows;
+  const result = await fetchJSON<{
+    workflows: WorkflowListEntry[];
+    recommended: string[];
+  }>(`/api/workflows${params}`);
+  return { workflows: result.workflows, recommended: result.recommended ?? [] };
 }
 
 export async function runWorkflow(

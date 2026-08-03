@@ -7,9 +7,10 @@
  */
 import { join } from 'path';
 import { getArchonHome } from '@archon/paths';
-import type { IDatabase, SqlDialect, QueryResult } from './adapters/types';
+import type { DbNotificationListener, IDatabase, SqlDialect, QueryResult } from './adapters/types';
 import { PostgresAdapter, postgresDialect } from './adapters/postgres';
 import { SqliteAdapter, sqliteDialect } from './adapters/sqlite';
+import { readSchemaVersion, type SchemaVersionInfo } from './schema-version';
 import { createLogger } from '@archon/paths';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -83,6 +84,31 @@ export function getDialect(): SqlDialect {
  */
 export function getDatabaseType(): 'postgresql' | 'sqlite' {
   return process.env.DATABASE_URL ? 'postgresql' : 'sqlite';
+}
+
+/**
+ * Read the recorded schema vintage (#2316): which Archon build created this database
+ * and which last applied schema to it. Returns null when no row was ever written.
+ * Diagnostic only — no caller gates on it.
+ */
+export async function getSchemaVersion(): Promise<SchemaVersionInfo | null> {
+  return readSchemaVersion(getDatabase());
+}
+
+/** Type guard: does this database implement the optional notification-listener capability? */
+function isDbNotificationListener(db: IDatabase): db is IDatabase & DbNotificationListener {
+  return typeof (db as Partial<DbNotificationListener>).listen === 'function';
+}
+
+/**
+ * Return the active database as a notification listener (Postgres `LISTEN/NOTIFY`),
+ * or null when the backend doesn't support it (SQLite). Feature-detection seam so
+ * the server can opt into real-time push only when available.
+ */
+export function getDbNotificationListener(): DbNotificationListener | null {
+  if (getDatabaseType() !== 'postgresql') return null;
+  const db = getDatabase();
+  return isDbNotificationListener(db) ? db : null;
 }
 
 /**

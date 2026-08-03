@@ -18,7 +18,7 @@ description: |
   9. Reports results back to the GitHub issue with follow-up suggestions
 
 provider: claude
-model: sonnet
+model: medium
 
 nodes:
   # ═══════════════════════════════════════════════════════════════
@@ -31,21 +31,55 @@ nodes:
 
       Request: $ARGUMENTS
 
-      Rules:
-      - If the message contains an explicit issue number (e.g., "#709", "issue 709", "709"), extract that number.
-      - If the message is ambiguous (e.g., "fix the SQLite timestamp bug"), use `gh issue list` to search for matching issues and pick the best match.
+      A reference is an ATOMIC pair: a number, and the repo it belongs to. Never take the
+      number from one reference and the repo from another — that combination fetches an
+      issue nobody asked for.
 
-      CRITICAL: Your final output must be ONLY the bare number with no quotes, no markdown, no explanation. Example correct output: 709
+      Recognised reference forms, each yielding one complete pair:
+      - `#709`, `issue 709`, `709`            -> {issue_number: "709", repo: ""}
+      - `owner/repo#709`                      -> {issue_number: "709", repo: "owner/repo"}
+      - `https://github.com/owner/repo/issues/709`
+                                              -> {issue_number: "709", repo: "owner/repo"}
+
+      An empty `repo` means "the current checkout" — the common case. NEVER guess a repo.
+
+      Then:
+      - Exactly one reference -> use it.
+      - Several references, all resolving to the SAME pair -> use it.
+      - Several DIFFERENT references (e.g. a bare number and a cross-repo URL) -> the
+        request is ambiguous. Do NOT pick one. Fail with a message naming every pair you
+        found and asking which was meant. Guessing here silently investigates the wrong
+        issue, which is worse than stopping.
+      - No reference at all (e.g. "fix the SQLite timestamp bug") -> search the CURRENT
+        repo with `gh issue list`, pick the best match, and leave `repo` empty.
+    output_format:
+      type: object
+      properties:
+        issue_number:
+          type: string
+        repo:
+          type: string
+      required:
+        - issue_number
+        - repo
 
   - id: fetch-issue
     bash: |
-      # Strip quotes, whitespace, markdown backticks from AI output
-      ISSUE_NUM=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
-      if [ -z "$ISSUE_NUM" ]; then
-        echo "Failed to extract issue number from: $extract-issue-number.output" >&2
+      # Substitutions are injected already shell-quoted by Archon — assign them
+      # unquoted, then quote normally as locals (see #1884).
+      num=$extract-issue-number.output.issue_number
+      repo=$extract-issue-number.output.repo
+      if ! printf '%s' "$num" | grep -qE '^[0-9]+$'; then
+        echo "extract-issue-number did not yield a numeric issue id: $num" >&2
         exit 1
       fi
-      gh issue view "$ISSUE_NUM" --json title,body,labels,comments,state,url,author
+      # An explicit owner/repo must be preserved: `gh issue view <n>` resolves against
+      # the CURRENT checkout, so a cross-repo URL would silently read this repo's #<n>.
+      if [ -n "$repo" ]; then
+        gh issue view "$num" --repo "$repo" --json title,body,labels,comments,state,url,author
+      else
+        gh issue view "$num" --json title,body,labels,comments,state,url,author
+      fi
     depends_on: [extract-issue-number]
 
   - id: classify
@@ -69,7 +103,7 @@ nodes:
 
       Provide reasoning for your classification.
     depends_on: [fetch-issue]
-    model: haiku
+    model: small
     allowed_tools: []
     output_format:
       type: object
@@ -133,7 +167,7 @@ nodes:
     command: archon-fix-issue
     depends_on: [bridge-artifacts]
     context: fresh
-    model: opus[1m]
+    model: large
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 5: VALIDATE
@@ -173,19 +207,27 @@ nodes:
          - `$ARTIFACTS_DIR/investigation.md` or `$ARTIFACTS_DIR/plan.md`
          - `$ARTIFACTS_DIR/implementation.md`
          - `$ARTIFACTS_DIR/validation.md`
-      4. Check if a PR already exists for this branch: `gh pr list --head $(git branch --show-current)`
+      4. Resolve the origin repo — in a fork clone, gh otherwise targets the upstream parent:
+         `ORIGIN_REPO=$(git remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')`
+         Then check if a PR already exists for this branch: `gh pr list --repo "$ORIGIN_REPO" --head $(git branch --show-current)`
          - If PR exists, skip creation and capture its number
       5. Look for the project's PR template at `.github/pull_request_template.md`, `.github/PULL_REQUEST_TEMPLATE.md`, or `docs/PULL_REQUEST_TEMPLATE.md`. Read whichever one exists.
-      6. Create a DRAFT PR: `gh pr create --draft --base $BASE_BRANCH`
+      6. Create a DRAFT PR: `gh pr create --repo "$ORIGIN_REPO" --draft --base $BASE_BRANCH`
          - Title: concise, imperative mood, under 70 chars
          - Body: if a PR template was found, fill in **every section** with details from the artifacts. Don't skip sections or leave placeholders. If no template, write a body with summary, changes, validation evidence, and `Fixes #...`.
          - **PR body file location**: if you write the body to a file (e.g. for `--body-file`), the file MUST live at `$ARTIFACTS_DIR/pr-body.md` or under `/tmp/` — NEVER inside the worktree. Files like `.pr-body.md` at the repo root will be picked up by later commits.
          - Link to issue: include `Fixes #...` or `Closes #...`
       7. Capture PR identifiers:
          ```bash
-         PR_NUMBER=$(gh pr view --json number -q '.number')
+         ORIGIN_REPO=$(git remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')
+         HEAD_BRANCH=$(git branch --show-current)
+         PR_NUMBER=$(gh pr list --repo "$ORIGIN_REPO" --head "$HEAD_BRANCH" --state open --json number -q '.[0].number')
+         if [ -z "$PR_NUMBER" ]; then
+           echo "No open PR found for branch $HEAD_BRANCH — PR creation failed" >&2
+           exit 1
+         fi
          echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"
-         PR_URL=$(gh pr view --json url -q '.url')
+         PR_URL=$(gh pr view "$PR_NUMBER" --repo "$ORIGIN_REPO" --json url -q '.url')
          echo "$PR_URL" > "$ARTIFACTS_DIR/.pr-url"
          ```
     depends_on: [validate]
@@ -198,12 +240,19 @@ nodes:
   - id: verify-pr-base
     bash: |
       set -euo pipefail
+      # Pin to the origin remote — in a fork clone, gh otherwise queries the upstream parent
+      ORIGIN_REPO=$(git remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')
+      HEAD_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+      PR_NUMBER=$(gh pr list --repo "$ORIGIN_REPO" --head "$HEAD_BRANCH" --state open --json number -q '.[0].number')
+      if [ -z "$PR_NUMBER" ]; then
+        echo "No open PR found for branch $HEAD_BRANCH" >&2
+        exit 1
+      fi
       EXPECTED="$BASE_BRANCH"
-      ACTUAL=$(gh pr view --json baseRefName -q '.baseRefName')
+      ACTUAL=$(gh pr view "$PR_NUMBER" --repo "$ORIGIN_REPO" --json baseRefName -q '.baseRefName')
       if [ "$ACTUAL" != "$EXPECTED" ]; then
-        PR_NUMBER=$(gh pr view --json number -q '.number')
         echo "Base mismatch on PR #$PR_NUMBER: expected=$EXPECTED actual=$ACTUAL — re-targeting" >&2
-        gh pr edit "$PR_NUMBER" --base "$EXPECTED"
+        gh pr edit "$PR_NUMBER" --repo "$ORIGIN_REPO" --base "$EXPECTED"
       else
         echo "PR base verified: $EXPECTED"
       fi
@@ -237,7 +286,7 @@ nodes:
 
       Provide your reasoning for each decision.
     depends_on: [review-scope]
-    model: haiku
+    model: small
     allowed_tools: []
     context: fresh
     output_format:
