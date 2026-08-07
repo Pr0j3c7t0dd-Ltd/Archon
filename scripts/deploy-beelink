@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPOSITORY="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPOSITORY"
+export ARCHON_HONCHO_ENV_FILE="${ARCHON_HONCHO_ENV_FILE:-/Users/todd/.archon/vendor/honcho/.env}"
+original_context="$(docker context show)"
+docker --context beelink build --platform linux/amd64 --pull --tag archon:beelink .
+docker --context beelink build --platform linux/amd64 --pull --tag archon-honcho:beelink /Users/todd/.archon/vendor/honcho
+docker --context beelink compose -f compose.beelink.yaml up -d --no-build --wait --wait-timeout 300
+[[ "$(docker context show)" == "$original_context" ]] || { printf 'The global Docker context changed unexpectedly.\n' >&2; exit 1; }
+docker --context beelink compose -f compose.beelink.yaml ps

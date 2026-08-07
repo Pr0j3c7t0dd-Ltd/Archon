@@ -1006,3 +1006,7 @@ Pattern: Use `classifyIsolationError()` (from `@archon/isolation`) to map git er
 - Parse `@archon` in issue/PR **comments only** (not descriptions)
 - Events: `issue_comment` only
 - Note: Descriptions often contain example commands or documentation - these are NOT command invocations (see #96)
+
+## Beelink Docker deployment
+
+Use `./scripts/deploy-beelink` for the personal deployment. It runs through `docker --context beelink` using the restored databases and `compose.beelink.yaml`. Verify both database groups, Redis, API, UI, and MCP. Fetch from `upstream`, but push only to the personal `origin`. Never delete rollback data without explicit approval.
