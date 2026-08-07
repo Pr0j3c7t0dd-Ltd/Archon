@@ -1,0 +1,153 @@
+name: archon-beelink
+
+services:
+  app:
+    image: archon:beelink
+    container_name: archon-app
+    env_file: .env
+    environment:
+      ARCHON_DOCKER: "true"
+    ports:
+      - "127.0.0.1:3090:3090"
+    volumes:
+      - archon_data:/.archon
+      - archon_user_home:/home/appuser
+    networks: [archon]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3090/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 6
+      start_period: 20s
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: archon-postgres
+    environment:
+      POSTGRES_DB: remote_coding_agent
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "127.0.0.1:53645:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [archon]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d remote_coding_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  honcho-api:
+    image: archon-honcho:beelink
+    container_name: archon-honcho-api
+    entrypoint: ["sh", "docker/entrypoint.sh"]
+    depends_on:
+      honcho-database:
+        condition: service_healthy
+      honcho-redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:18080:8000"
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    environment:
+      DB_CONNECTION_URI: postgresql+psycopg://postgres:postgres@honcho-database:5432/postgres
+      CACHE_URL: redis://honcho-redis:6379/0?suppress=true
+      CACHE_ENABLED: "true"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file: ${ARCHON_HONCHO_ENV_FILE:-/Users/todd/.archon/vendor/honcho/.env}
+    networks: [honcho]
+    restart: unless-stopped
+
+  honcho-deriver:
+    image: archon-honcho:beelink
+    container_name: archon-honcho-deriver
+    entrypoint: ["/app/.venv/bin/python", "-m", "src.deriver"]
+    depends_on:
+      honcho-api:
+        condition: service_healthy
+      honcho-database:
+        condition: service_healthy
+      honcho-redis:
+        condition: service_healthy
+    environment:
+      DB_CONNECTION_URI: postgresql+psycopg://postgres:postgres@honcho-database:5432/postgres
+      CACHE_URL: redis://honcho-redis:6379/0?suppress=true
+      CACHE_ENABLED: "true"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:19090:9090"
+    env_file: ${ARCHON_HONCHO_ENV_FILE:-/Users/todd/.archon/vendor/honcho/.env}
+    networks: [honcho]
+    restart: unless-stopped
+
+  honcho-database:
+    image: pgvector/pgvector:pg15
+    container_name: archon-honcho-postgres
+    command: ["postgres", "-c", "max_connections=200"]
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "127.0.0.1:15432:5432"
+    volumes:
+      - honcho_pgdata:/var/lib/postgresql/data
+    networks: [honcho]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  honcho-redis:
+    image: redis:8.2
+    container_name: archon-honcho-redis
+    ports:
+      - "127.0.0.1:16379:6379"
+    volumes:
+      - honcho_redis_data:/data
+    networks: [honcho]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  archon_data:
+    external: true
+    name: archon-beelink_archon_data
+  archon_user_home:
+    external: true
+    name: archon-beelink_archon_user_home
+  postgres_data:
+    external: true
+    name: archon-beelink_postgres_data
+  honcho_pgdata:
+    external: true
+    name: archon-beelink_honcho_pgdata
+  honcho_redis_data:
+    external: true
+    name: archon-beelink_honcho_redis_data
+
+networks:
+  archon:
+    name: archon-beelink-network
+  honcho:
+    name: archon-honcho-beelink-network
